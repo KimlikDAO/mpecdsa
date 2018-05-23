@@ -1,0 +1,4 @@
+[submodule "curves"]
+	path = curves
+	url = git@gitlab.com:neucrypt/curves.git
+	branch = release
