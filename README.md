@@ -1,9 +1,18 @@
 # MPECDSA
 
 This repository contains an implementation of the 2-of-n threshold ECDSA protocol described in
-_Threshold ECDSA from ECDSA assumptions_ by Jack Dorner, Yashvanth Kondi, Eysa Lee, and abhi shelat
+_Threshold ECDSA from ECDSA assumptions_ by Jack Dorner, Yashvanth Kondi, Eysa Lee, and abhi shelat, appearing at the IEEE Security & Privacy Conference (Oakland) 2018.  The paper is available from [IEEE](https://www.computer.org/csdl/proceedings/sp/2018/4353/00/435301a595-abs.html) and a full version with complete proofs is available from [eprint/2018/499](https://eprint.iacr.org/2018/499).
+
 
 ## How to compile on Linux
+
+You will need to initialize your repository. After cloning this repository, run
+
+```
+$ git submodule init
+$ git submodule update
+```
+to pull the code for the curve library that is associated with this project.
 
 The protocol is implemented in Rust, and requires features in rust nightly (as of early 2018).  We have found the easiest way to install this is to use [rustup](https://rustup.rs/).
 ```
