@@ -5,12 +5,16 @@ authors = ["abhi <abhi@neu.edu>", "Jack Doerner <j@ckdoerner.net>"]
 build = "build.rs"
 
 [dependencies]
-getopts = "0.2"
+getopts = "0.2.21"
 rand = "0.3.16"
 curves = { path = "./curves" }
 rust-crypto = "^0.2"
 time="*"
 byteorder = "1.1.0"
 bit_reverse = "0.1.7"
-openmp-sys = "0.1.1"
-rayon = "1.0"
+rayon = "1.1"
+hex = "*"
+
+[features]
+blake2 = []
+rpi3 = ["blake2"]

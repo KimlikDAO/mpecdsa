@@ -1,17 +1,21 @@
+/***********
+ * This module implements the KOS Oblivious Transfer Extension Protocol,
+ * as described in the paper "Actively Secure OT Extension with Optimal Overhead"
+ * by Keller, Orsini, and Scholl (https://eprint.iacr.org/2015/546)
+ * 
+ * Base OTs for this protocol are provided by the VSOT protocol in rot.rs
+ ***********/
+
 use std::io::{BufWriter};
 use std::result::{Result};
-//use std::sync::atomic::{AtomicUsize,Ordering};
 
 use rand::{Rng};
 
-use curves::{Ford, SecpOrd, precomp};
-
-use byteorder::{ByteOrder, LittleEndian};
+use curves::{Ford, SecpOrd};
 
 use bit_reverse::ParallelReverse;
 
-//use time::{PreciseTime,Duration};
-
+use super::ro::*;
 use super::mpecdsa_error::*;
 use super::rot::*;
 use super::*;
@@ -50,8 +54,7 @@ fn transpose8x8(w: u64) -> u64 {
 fn transpose(data: &Vec<u8>, majtilelen: usize) -> Vec<u8> {
 	let minlen = data.len()/majtilelen;
 	let mintilelen = minlen/8;
-	let mut result: Vec<u8> = Vec::with_capacity(data.len());
-	result.resize_default(data.len()); //fill with 0
+	let mut result: Vec<u8> = vec![0u8;data.len()];
 	for jj in 0..mintilelen {
 		for ii in 0..majtilelen {
 			let chunk:u64 = ((data[(jj * 8 + 0) * majtilelen + ii] as u64) << 56)
@@ -76,25 +79,19 @@ fn transpose(data: &Vec<u8>, majtilelen: usize) -> Vec<u8> {
 	result
 }
 
-#[derive(Clone)]
+//#[derive(Clone)]
 pub struct OTESender {
-	publicrandomvec: [SecpOrd;SecpOrd::NBITS+ENCODING_SEC_PARAM],
 	correlation: [bool; SecpOrd::NBITS],
 	compressed_correlation: [u8; SecpOrd::NBYTES],
-	seeds: Vec<[u8;HASH_SIZE]>,
-	//extindex: AtomicUsize,
-	//transindex: AtomicUsize
+	seeds: Vec<[u8;HASH_SIZE]>
 }
 
-#[derive(Clone)]
+//#[derive(Clone)]
 pub struct OTERecver {
-	publicrandomvec: [SecpOrd;SecpOrd::NBITS+ENCODING_SEC_PARAM],
-	seeds: Vec<([u8;HASH_SIZE],[u8;HASH_SIZE])>,
-	//extindex: AtomicUsize,
-	//transindex: AtomicUsize
+	seeds: Vec<([u8;HASH_SIZE],[u8;HASH_SIZE])>
 }
 
-#[derive(Clone)]
+//#[derive(Clone)]
 pub enum OTEPlayer {
 	Sender(OTESender),
 	Recver(OTERecver),
@@ -102,7 +99,7 @@ pub enum OTEPlayer {
 }
 
 impl OTESender {
-	pub fn new<T1:Read, T2:Write>(rng: &mut Rng, recv:&mut T1, send: &mut T2) -> Result<OTESender,MPECDSAError> {
+	pub fn new<T1:Read, T2:Write>(ro: &DyadicROTagger, rng: &mut dyn Rng, recv:&mut T1, send: &mut T2) -> Result<OTESender,MPECDSAError> {
 		let mut correlation = [false;SecpOrd::NBITS];
 		for ii in 0..SecpOrd::NBITS {
 			correlation[ii] = (rng.next_u32() % 2)>0;
@@ -120,80 +117,58 @@ impl OTESender {
 										|((correlation[ii*8+7] as u8) << 7);
 		}
 
-		let mut publicrandomvec = [SecpOrd::ZERO;ENCODING_SEC_PARAM+SecpOrd::NBITS];
-		let mut raw_nonce = [0u8;SecpOrd::NBYTES];
-		try!(recv.read_exact(&mut raw_nonce));
-		let mut nonce = SecpOrd::from_bytes(&raw_nonce);
-		let mut prv_element = [0u8;SecpOrd::NBYTES];
-		for ii in 0..(ENCODING_SEC_PARAM+SecpOrd::NBITS) {
-			nonce = nonce.add(&SecpOrd::ONE);
-			nonce.to_bytes(&mut raw_nonce);
-			hash(&mut prv_element, &raw_nonce);
-			publicrandomvec[ii] = SecpOrd::from_bytes(&prv_element);
-		}
-
-		let seeds = try!(rot_recv_batch(&correlation, rng, recv, send));
+		let seeds = rot_recv_batch(&correlation, &ro, rng, recv, send)?;
 
 		Ok(OTESender {
-			publicrandomvec: publicrandomvec,
 			correlation: correlation,
 			compressed_correlation,
 			seeds: seeds
 		})
 	}
 
-	pub fn mul_extend<T:Read>(&self, extindex: usize, input_count: usize, recv:&mut T) -> Result<(Vec<[u8;HASH_SIZE*2*SecpOrd::NBITS]>,[u8;ENCODING_SEC_PARAM*HASH_SIZE]),MPECDSAError> {
-		//let extindex = self.extindex.fetch_add(1, Ordering::Relaxed);
-		let prgoutputlen = input_count*2*SecpOrd::NBITS + ENCODING_SEC_PARAM + OT_SEC_PARAM;
+	pub fn extend<T:Read>(&self, input_len: usize, ro: &DyadicROTagger, recv:&mut T) -> Result<Vec<u8>,MPECDSAError> {
+		let prgoutputlen = input_len + OT_SEC_PARAM;
 		let mut expanded_seeds: Vec<u8> = Vec::with_capacity(SecpOrd::NBYTES * prgoutputlen);
 		let prgiterations = ((prgoutputlen/8) + HASH_SIZE - 1) / HASH_SIZE;
 
 		debug_assert!((SecpOrd::NBYTES * prgoutputlen)%HASH_SIZE ==0);
 
-		//let t1 = PreciseTime::now();
+		let mut tagrange = ro.allocate_dyadic_range((SecpOrd::NBITS*prgiterations + prgoutputlen + 1) as u64);
 
 		let mut prgoutput = vec![0u8; HASH_SIZE*prgiterations*SecpOrd::NBITS];
 		let mut hasherinput = vec![0u8; HASH_BLOCK_SIZE*prgiterations*SecpOrd::NBITS];
 		for ii in 0..SecpOrd::NBITS {
 			for jj in 0..prgiterations {
-				LittleEndian::write_u64(&mut hasherinput[((ii*prgiterations+jj) * HASH_BLOCK_SIZE + HASH_SIZE)..((ii*prgiterations+jj) * HASH_BLOCK_SIZE + HASH_SIZE + 8)], extindex as u64);
-				LittleEndian::write_u64(&mut hasherinput[((ii*prgiterations+jj) * HASH_BLOCK_SIZE + HASH_SIZE + 8)..((ii*prgiterations+jj) * HASH_BLOCK_SIZE + HASH_SIZE + 16)], (jj*SecpOrd::NBITS + ii) as u64);
-				hasherinput[((ii*prgiterations+jj) * HASH_BLOCK_SIZE)..((ii*prgiterations+jj) * HASH_BLOCK_SIZE + HASH_SIZE)].copy_from_slice(&self.seeds[ii]);
+				// Map for (ii,jj): [ 20B: RO index | 32B: seed[ii] ], total: 52B
+				hasherinput[((ii*prgiterations+jj) * HASH_BLOCK_SIZE)..((ii*prgiterations+jj) * HASH_BLOCK_SIZE + RO_TAG_SIZE)].copy_from_slice(&tagrange.next()?[..]);
+				hasherinput[((ii*prgiterations+jj) * HASH_BLOCK_SIZE + RO_TAG_SIZE)..((ii*prgiterations+jj) * HASH_BLOCK_SIZE + RO_TAG_SIZE + HASH_SIZE)].copy_from_slice(&self.seeds[ii]);
 			}
 		}
 
-		sha256_multi(&hasherinput, &mut prgoutput, SecpOrd::NBITS*prgiterations);
+		hash_multi(&hasherinput, &mut prgoutput, SecpOrd::NBITS*prgiterations);
 
 		for ii in 0..SecpOrd::NBITS {
 			expanded_seeds.extend_from_slice(&prgoutput[(ii*prgiterations*HASH_SIZE)..(ii*prgiterations*HASH_SIZE+prgoutputlen/8)]);
 		}
 
-		//let t2 = PreciseTime::now();
-		//println!("Seed Expansion: {} microseconds", t1.to(t2).num_microseconds().unwrap());
-
-		let mut seeds_combined: Vec<u8> = Vec::with_capacity(SecpOrd::NBYTES * prgoutputlen);
-		seeds_combined.resize_default(SecpOrd::NBYTES * prgoutputlen);
+		let mut seeds_combined = vec![0u8;SecpOrd::NBYTES * prgoutputlen + RO_TAG_SIZE];
 		let mut sampled_bits = [0u8; SecpOrd::NBYTES];
 		let mut sampled_seeds = [0u8; SecpOrd::NBYTES];
-		try!(recv.read_exact(&mut seeds_combined));
-		try!(recv.read_exact(&mut sampled_bits));
-		try!(recv.read_exact(&mut sampled_seeds));
-
-		//let t3 = PreciseTime::now();
-		//println!("Read: {} microseconds", t2.to(t3).num_microseconds().unwrap());
+		recv.read_exact(&mut seeds_combined[0..SecpOrd::NBYTES * prgoutputlen])?;
+		recv.read_exact(&mut sampled_bits)?;
+		recv.read_exact(&mut sampled_seeds)?;
 
 		let mut random_samples = vec![0u8; HASH_SIZE * prgoutputlen];
 		let mut seeds_shortened = [0u8;HASH_SIZE];
 		let mut hash_input = vec![0u8;HASH_BLOCK_SIZE*prgoutputlen];
+		seeds_combined[(SecpOrd::NBYTES * prgoutputlen)..].copy_from_slice(&tagrange.next()?[..]);
 		hash(&mut seeds_shortened, &seeds_combined);
 		for ii in 0..prgoutputlen {
-			hash_input[(ii*HASH_BLOCK_SIZE)..(ii*HASH_BLOCK_SIZE+HASH_SIZE)].copy_from_slice(&seeds_shortened);
-			LittleEndian::write_u64(&mut hash_input[(ii*HASH_BLOCK_SIZE+HASH_SIZE)..(ii*HASH_BLOCK_SIZE+HASH_SIZE+8)], ii as u64);
+			// Map for ii: [ 20B: RO tag | 32B: seeds_shortened ], total: 52B
+			hash_input[(ii*HASH_BLOCK_SIZE)..(ii*HASH_BLOCK_SIZE+RO_TAG_SIZE)].copy_from_slice(&tagrange.next()?[..]);
+			hash_input[(ii*HASH_BLOCK_SIZE+RO_TAG_SIZE)..(ii*HASH_BLOCK_SIZE+HASH_SIZE+RO_TAG_SIZE)].copy_from_slice(&seeds_shortened);
 		}
-		sha256_multi(&hash_input, &mut random_samples, prgoutputlen);
-
-		//let t4 = PreciseTime::now();
-		//println!("Sampling: {} microseconds", t3.to(t4).num_microseconds().unwrap());
+		hash_multi(&hash_input, &mut random_samples, prgoutputlen);
 
 		let mut check_vec: Vec<u8> = Vec::with_capacity(SecpOrd::NBITS * prgoutputlen/8);
 		for ii in 0..SecpOrd::NBITS {
@@ -203,9 +178,6 @@ impl OTESender {
 		}
 
 		let transposed_check_vec = transpose(&check_vec, prgoutputlen/8);
-
-		//let t5 = PreciseTime::now();
-		//println!("Seed Expansion: {} microseconds", t4.to(t5).num_microseconds().unwrap());
 
 		let mut sampled_check = [0u8; SecpOrd::NBYTES];
 		for ii in 0..prgoutputlen {
@@ -219,187 +191,161 @@ impl OTESender {
 			rhs[ii] = sampled_seeds[ii] ^ (self.compressed_correlation[ii] & sampled_bits[ii]);
 		}
 
-		//let t6 = PreciseTime::now();
-		//println!("Verification: {} microseconds", t5.to(t6).num_microseconds().unwrap());
-
-		//finally, collate the output
-		let mut transposed_seed_fragments:Vec<[u8;HASH_SIZE * 2 * SecpOrd::NBITS]> = Vec::with_capacity(input_count);
-		for ii in 0..input_count {
-			let mut fragment = [0u8;2*SecpOrd::NBITS*HASH_SIZE];
-			fragment.copy_from_slice(&transposed_check_vec[(ii * 2*SecpOrd::NBITS*HASH_SIZE)..((ii+1) * 2*SecpOrd::NBITS*HASH_SIZE)]);
-			transposed_seed_fragments.push(fragment);
-		}
-		let mut transposed_seed_encoding_fragment = [0u8;ENCODING_SEC_PARAM*HASH_SIZE];
-		transposed_seed_encoding_fragment.copy_from_slice(&transposed_check_vec[(input_count * 2*SecpOrd::NBITS*HASH_SIZE)..(input_count * 2*SecpOrd::NBITS * HASH_SIZE + ENCODING_SEC_PARAM * HASH_SIZE)]);
-
 		if vec_eq(&sampled_check, &rhs) {
-			Ok((transposed_seed_fragments,transposed_seed_encoding_fragment))
+			Ok(transposed_check_vec)
 		} else {
 			Err(MPECDSAError::Proof(ProofError::new("Verification Failed for OTE (receiver cheated)")))
 		}
 	}
 
-	pub fn  mul_transfer<T:Write>(&self, transindex: usize, input_alpha: &SecpOrd, transposed_seed_fragment: &[u8;2*SecpOrd::NBITS*HASH_SIZE], transposed_seed_encoding_fragment: &[u8;ENCODING_SEC_PARAM*HASH_SIZE], rng:&mut Rng, send: &mut T) -> Result<SecpOrd,MPECDSAError> {
-		//let transindex = self.transindex.fetch_add(1, Ordering::Relaxed);
 
-		let gadget_table = match SecpOrd::NBITS {
-			256 => &precomp::GADGET_TABLE_256,
-			_ => { return Err(MPECDSAError::General); }
-		};
+	pub fn transfer<T:Write>(&self, input_len: &[usize], input_correlation: &[&SecpOrd], transposed_seed: &[&[u8]], ro: &DyadicROTagger, rng:&mut dyn Rng, send: &mut T) -> Result<Vec<Vec<SecpOrd>>,MPECDSAError> {
+		let input_count: usize = input_len.len();
+		let total_input_len: usize = input_len.iter().sum();
+		let mut tagrange = ro.allocate_dyadic_range((2*total_input_len + 2*input_count + 2) as u64);
 
+		let mut hasherinput = vec![0u8; 2*HASH_BLOCK_SIZE*total_input_len];
+		let mut hashoutput = vec![0u8; 2*HASH_SIZE*total_input_len];
+		let mut vals0: Vec<Vec<SecpOrd>> = Vec::with_capacity(input_count);
+		let mut check_hashoutput = vec![0u8; 2*HASH_SIZE*total_input_len];
+		let mut check_vals0: Vec<Vec<SecpOrd>> = Vec::with_capacity(input_count);
+		let mut check_alpha = vec![SecpOrd::ZERO;input_count];
 
-		let mut transposed_seed = [0u8;(2*SecpOrd::NBITS + ENCODING_SEC_PARAM)*HASH_SIZE];
-		transposed_seed[0..(2*SecpOrd::NBITS*HASH_SIZE)].copy_from_slice(transposed_seed_fragment);
-		transposed_seed[(2*SecpOrd::NBITS * HASH_SIZE)..].copy_from_slice(transposed_seed_encoding_fragment);
+		let mut input_len_offset = 0;
+		for kk in 0..input_count {
+			check_alpha[kk] = SecpOrd::rand(rng);
+			let localhasherinput = &mut hasherinput[(input_len_offset*HASH_BLOCK_SIZE)..((input_len_offset + 2*input_len[kk])*HASH_BLOCK_SIZE)];
 
-		let mut hasherinput = [0u8; 2*HASH_BLOCK_SIZE*(2*SecpOrd::NBITS + ENCODING_SEC_PARAM)];
-		let mut hashoutput = [0u8; 2*HASH_SIZE*(2*SecpOrd::NBITS + ENCODING_SEC_PARAM)];
-		let mut vals0 = [SecpOrd::ZERO; 2*SecpOrd::NBITS + ENCODING_SEC_PARAM];
-		let mut check_hashoutput = [0u8; 2*HASH_SIZE*(2*SecpOrd::NBITS + ENCODING_SEC_PARAM)];
-		let mut check_vals0 = [SecpOrd::ZERO; 2*SecpOrd::NBITS + ENCODING_SEC_PARAM];
-		let mut result = SecpOrd::ZERO;
-		let check_alpha = SecpOrd::rand(rng);
-
-		for ii in 0..(2*SecpOrd::NBITS + ENCODING_SEC_PARAM) {
-			LittleEndian::write_u64(&mut hasherinput[(ii * HASH_BLOCK_SIZE + HASH_SIZE)..(ii * HASH_BLOCK_SIZE + HASH_SIZE + 8)], (2*transindex) as u64);
-			LittleEndian::write_u64(&mut hasherinput[(HASH_BLOCK_SIZE*(2*SecpOrd::NBITS + ENCODING_SEC_PARAM) + ii * HASH_BLOCK_SIZE + HASH_SIZE)..(HASH_BLOCK_SIZE*(2*SecpOrd::NBITS + ENCODING_SEC_PARAM) + ii * HASH_BLOCK_SIZE + HASH_SIZE + 8)], (2*transindex) as u64);
-			LittleEndian::write_u64(&mut hasherinput[(ii * HASH_BLOCK_SIZE + HASH_SIZE + 8)..(ii * HASH_BLOCK_SIZE + HASH_SIZE + 16)], ii as u64);
-			LittleEndian::write_u64(&mut hasherinput[(HASH_BLOCK_SIZE*(2*SecpOrd::NBITS + ENCODING_SEC_PARAM) + ii * HASH_BLOCK_SIZE + HASH_SIZE + 8)..(HASH_BLOCK_SIZE*(2*SecpOrd::NBITS + ENCODING_SEC_PARAM) + ii * HASH_BLOCK_SIZE + HASH_SIZE + 16)], ii as u64);
-			hasherinput[(ii * HASH_BLOCK_SIZE)..(ii * HASH_BLOCK_SIZE + HASH_SIZE)].copy_from_slice(&transposed_seed[(ii*HASH_SIZE)..((ii+1)*HASH_SIZE)]);
-			hasherinput[(HASH_BLOCK_SIZE*(2*SecpOrd::NBITS + ENCODING_SEC_PARAM) + ii * HASH_BLOCK_SIZE)..(HASH_BLOCK_SIZE*(2*SecpOrd::NBITS + ENCODING_SEC_PARAM) + ii * HASH_BLOCK_SIZE + HASH_SIZE)].copy_from_slice(&transposed_seed[(ii*HASH_SIZE)..((ii+1)*HASH_SIZE)]);
-			for jj in 0..HASH_SIZE {
-				hasherinput[HASH_BLOCK_SIZE*(2*SecpOrd::NBITS + ENCODING_SEC_PARAM) + ii * HASH_BLOCK_SIZE + jj] ^= self.compressed_correlation[jj];	
+			for ii in 0..input_len[kk] {
+				// Map for ii: [ 20B: RO tag | 32B: transposed_seed[ii] ], total: 52B
+				// Map for ii + 1: [  20B: RO tag | 32B: transposed_seed[ii]^compressed_correlation[jj] ], total: 52B
+				let tag = tagrange.next()?;
+				localhasherinput[(2 * ii * HASH_BLOCK_SIZE)..(2*ii * HASH_BLOCK_SIZE + RO_TAG_SIZE)].copy_from_slice(&tag[..]);
+				localhasherinput[(2*ii * HASH_BLOCK_SIZE + RO_TAG_SIZE)..(2 * ii * HASH_BLOCK_SIZE + RO_TAG_SIZE + HASH_SIZE)].copy_from_slice(&transposed_seed[kk][(ii*HASH_SIZE)..((ii+1)*HASH_SIZE)]);
+				localhasherinput[( (2 * ii + 1) * HASH_BLOCK_SIZE)..( (2 * ii + 1) * HASH_BLOCK_SIZE + RO_TAG_SIZE)].copy_from_slice(&tag[..]);
+				localhasherinput[( (2 * ii + 1) * HASH_BLOCK_SIZE + RO_TAG_SIZE)..( (2 * ii + 1) * HASH_BLOCK_SIZE + RO_TAG_SIZE + HASH_SIZE)].copy_from_slice(&transposed_seed[kk][(ii*HASH_SIZE)..((ii+1)*HASH_SIZE)]);
+				for jj in 0..HASH_SIZE {
+					localhasherinput[ (2 * ii + 1) * HASH_BLOCK_SIZE + RO_TAG_SIZE + jj] ^= self.compressed_correlation[jj];	
+				}
 			}
+
+			input_len_offset = input_len_offset + 2*input_len[kk];
 		}
 
-		sha256_multi(&hasherinput, &mut hashoutput, 2*(2*SecpOrd::NBITS + ENCODING_SEC_PARAM));
+		hash_multi(&hasherinput, &mut hashoutput, 2*total_input_len);
 
-		let mut correction_vec_raw = [0u8; (2*SecpOrd::NBITS + ENCODING_SEC_PARAM) * SecpOrd::NBYTES];
-		for ii in 0..(2*SecpOrd::NBITS + ENCODING_SEC_PARAM) {
-			// primary value
-			vals0[ii] = SecpOrd::from_bytes(&hashoutput[(ii*HASH_SIZE)..((ii+1)*HASH_SIZE)]);
-			let offset = if ii < SecpOrd::NBITS {
-				&gadget_table[SecpOrd::NBITS - (ii/8)*8 -8 + (ii%8)]
-			} else {
-				&self.publicrandomvec[(ii/8)*8-SecpOrd::NBITS+ii%8]
-			};
-			result = result.add(&vals0[ii].mul(offset));
-			let val1 = SecpOrd::from_bytes(&hashoutput[(HASH_SIZE*(2*SecpOrd::NBITS + ENCODING_SEC_PARAM) + ii*HASH_SIZE)..(HASH_SIZE*(2*SecpOrd::NBITS + ENCODING_SEC_PARAM) + (ii+1)*HASH_SIZE)]);
-			val1.sub(&vals0[ii]).add(&input_alpha).to_bytes(&mut correction_vec_raw[(ii*SecpOrd::NBYTES)..((ii+1)*SecpOrd::NBYTES)]);
-		}
-		try!(send.write(&correction_vec_raw));
-
-		for ii in 0..(2*SecpOrd::NBITS + ENCODING_SEC_PARAM) {
-			let mut temp = [0u8;8];
-			temp.copy_from_slice(&hasherinput[(ii * HASH_BLOCK_SIZE + HASH_SIZE)..(ii * HASH_BLOCK_SIZE + HASH_SIZE + 8)]);
-			LittleEndian::write_u64(&mut hasherinput[(ii * HASH_BLOCK_SIZE + HASH_SIZE)..(ii * HASH_BLOCK_SIZE + HASH_SIZE + 8)], (2*transindex+1) as u64);
-			for jj in 0..8 {
-				hasherinput[HASH_BLOCK_SIZE*(2*SecpOrd::NBITS + ENCODING_SEC_PARAM) + ii * HASH_BLOCK_SIZE + HASH_SIZE + jj] ^= temp[jj] ^ hasherinput[ii * HASH_BLOCK_SIZE + HASH_SIZE + jj];
+		let mut correction_vec_raw = vec![0u8; total_input_len * SecpOrd::NBYTES + RO_TAG_SIZE];
+		let mut vals0_offset = 0;
+		for kk in 0..input_count {
+			let mut localvals0 = vec![SecpOrd::ZERO;input_len[kk]];
+			let localhashoutput = &hashoutput[(2*vals0_offset*HASH_SIZE)..(2*(vals0_offset+input_len[kk])*HASH_SIZE)];
+			let localcorrectionvec = &mut correction_vec_raw[(vals0_offset*SecpOrd::NBYTES)..((vals0_offset+input_len[kk])*SecpOrd::NBYTES)];
+			for ii in 0..input_len[kk] {
+				// primary value; with space at the end for the RO tag (this is more convenient than putting it at the start)
+				localvals0[ii] = SecpOrd::from_bytes(&localhashoutput[(2*ii*HASH_SIZE)..((2*ii+1)*HASH_SIZE)]);
+				let val1 = SecpOrd::from_bytes(&localhashoutput[((2*ii+1)*HASH_SIZE)..((2*ii+2)*HASH_SIZE)]);
+				val1.sub(&localvals0[ii]).add(input_correlation[kk]).to_bytes(&mut localcorrectionvec[(ii*SecpOrd::NBYTES)..((ii+1)*SecpOrd::NBYTES)]);
 			}
+			vals0.push(localvals0);
+			vals0_offset = vals0_offset + input_len[kk];
+		}
+		send.write(&correction_vec_raw[0..total_input_len * SecpOrd::NBYTES])?;
+
+		input_len_offset = 0;
+		for kk in 0..input_count {
+			let localhasherinput = &mut hasherinput[(input_len_offset*HASH_BLOCK_SIZE)..((input_len_offset + 2*input_len[kk])*HASH_BLOCK_SIZE)];
+			for ii in 0..input_len[kk] {
+				// Map for ii: [ 20B: RO tag | 32B: transposed_seed[ii] ], total: 52B
+				// Map for input_len + ii: [ 20B: RO tag | 32B: transposed_seed[ii]^compressed_correlation[jj] ], total: 52B
+				let tag = tagrange.next()?;
+				localhasherinput[(2 * ii * HASH_BLOCK_SIZE)..(2*ii * HASH_BLOCK_SIZE + RO_TAG_SIZE)].copy_from_slice(&tag[..]);
+				localhasherinput[((2 * ii + 1) * HASH_BLOCK_SIZE)..((2 * ii + 1) * HASH_BLOCK_SIZE + RO_TAG_SIZE)].copy_from_slice(&tag[..]);
+			}
+			input_len_offset = input_len_offset + 2*input_len[kk];
 		}
 
-		sha256_multi(&hasherinput, &mut check_hashoutput, 2*(2*SecpOrd::NBITS + ENCODING_SEC_PARAM));
+		hash_multi(&hasherinput, &mut check_hashoutput, 2*total_input_len);
 
-		let mut check_correction_vec_raw = [0u8; (2*SecpOrd::NBITS + ENCODING_SEC_PARAM) * SecpOrd::NBYTES];
-		for ii in 0..(2*SecpOrd::NBITS + ENCODING_SEC_PARAM) {
-			// check value
-			check_vals0[ii] = SecpOrd::from_bytes(&check_hashoutput[(ii*HASH_SIZE)..((ii+1)*HASH_SIZE)]);
-			let check_val1 = SecpOrd::from_bytes(&check_hashoutput[(HASH_SIZE*(2*SecpOrd::NBITS + ENCODING_SEC_PARAM) + ii*HASH_SIZE)..(HASH_SIZE*(2*SecpOrd::NBITS + ENCODING_SEC_PARAM) + (ii+1)*HASH_SIZE)]);
-			check_val1.sub(&check_vals0[ii]).add(&check_alpha).to_bytes(&mut check_correction_vec_raw[(ii*SecpOrd::NBYTES)..((ii+1)*SecpOrd::NBYTES)]);
+		let mut check_correction_vec_raw = vec![0u8; total_input_len * SecpOrd::NBYTES + RO_TAG_SIZE];
+		vals0_offset = 0;
+		for kk in 0..input_count {
+			let mut localcheckvals0 = vec![SecpOrd::ZERO;input_len[kk]];
+			let localcheckhashoutput = &check_hashoutput[(2*vals0_offset*HASH_SIZE)..(2*(vals0_offset+input_len[kk])*HASH_SIZE)];
+			let localcheckcorrectionvec = &mut check_correction_vec_raw[(vals0_offset*SecpOrd::NBYTES)..((vals0_offset+input_len[kk])*SecpOrd::NBYTES)];
+			for ii in 0..input_len[kk] {
+				// check value; with space at the end for the RO tag (this is more convenient than putting it at the start)
+				localcheckvals0[ii] = SecpOrd::from_bytes(&localcheckhashoutput[(2*ii*HASH_SIZE)..((2*ii+1)*HASH_SIZE)]);
+				let check_val1 = SecpOrd::from_bytes(&localcheckhashoutput[((2*ii+1)*HASH_SIZE)..((2*ii+2)*HASH_SIZE)]);
+				check_val1.sub(&localcheckvals0[ii]).add(&check_alpha[kk]).to_bytes(&mut localcheckcorrectionvec[(ii*SecpOrd::NBYTES)..((ii+1)*SecpOrd::NBYTES)]);
+			}
+			check_vals0.push(localcheckvals0);
+			vals0_offset = vals0_offset + input_len[kk];
 		}
-		try!(send.write(&check_correction_vec_raw));
+		send.write(&check_correction_vec_raw[0..total_input_len * SecpOrd::NBYTES])?;
 
-		let mut coef = [0u8;HASH_SIZE];
-		let mut check_coef = [0u8;HASH_SIZE];
-		hash(&mut coef, &correction_vec_raw);
-		hash(&mut check_coef, &check_correction_vec_raw);
-		let coef = SecpOrd::from_bytes(&coef);
-		let check_coef = SecpOrd::from_bytes(&check_coef);
+		let mut coef_seed = [0u8;HASH_SIZE+RO_TAG_SIZE];
+		let mut coef_raw = [0u8;HASH_SIZE];
+		let mut coefs = vec![SecpOrd::ZERO;input_count];
+		correction_vec_raw[total_input_len * SecpOrd::NBYTES..].copy_from_slice(&tagrange.next()?[..]);
+		hash(&mut coef_raw, &correction_vec_raw);
+		coef_seed[0..HASH_SIZE].copy_from_slice(&coef_raw);
+
+		for kk in 0..input_count {
+			coef_seed[HASH_SIZE..].copy_from_slice(&tagrange.next()?[..]);
+			hash(&mut coef_raw, &coef_seed);
+			coefs[kk] = SecpOrd::from_bytes(&coef_raw);
+		}
+
+		let mut check_coef_seed = [0u8;HASH_SIZE+RO_TAG_SIZE];
+		let mut check_coef_raw = [0u8;HASH_SIZE];
+		let mut check_coefs = vec![SecpOrd::ZERO;input_count];
+		check_correction_vec_raw[total_input_len * SecpOrd::NBYTES..].copy_from_slice(&tagrange.next()?[..]);
+		hash(&mut check_coef_raw, &check_correction_vec_raw);
+		check_coef_seed[0..HASH_SIZE].copy_from_slice(&check_coef_raw);
+
+		for kk in 0..input_count {
+			check_coef_seed[HASH_SIZE..].copy_from_slice(&tagrange.next()?[..]);
+			hash(&mut check_coef_raw, &check_coef_seed);
+			check_coefs[kk] = SecpOrd::from_bytes(&check_coef_raw);
+		}
 			
-		let mut check_vec_raw = [0u8; (2*SecpOrd::NBITS + ENCODING_SEC_PARAM) * SecpOrd::NBYTES];
-		for ii in 0..(2*SecpOrd::NBITS + ENCODING_SEC_PARAM) {
-			vals0[ii].mul(&coef).add(&check_vals0[ii].mul(&check_coef)).to_bytes(&mut check_vec_raw[(ii*SecpOrd::NBYTES)..((ii+1)*SecpOrd::NBYTES)]);
+		let mut check_vec = vec![SecpOrd::ZERO; *input_len.iter().max().unwrap()];
+		for kk in 0..input_count {
+			for ii in 0..input_len[kk] {
+				check_vec[ii] = check_vec[ii].add(&vals0[kk][ii].mul(&coefs[kk]).add(&check_vals0[kk][ii].mul(&check_coefs[kk])));
+			}
 		}
-		try!(send.write(&check_vec_raw));
 
-		let reference = input_alpha.mul(&coef).add(&check_alpha.mul(&check_coef));
-		let mut reference_raw = [0u8;SecpOrd::NBYTES];
-		reference.to_bytes(&mut reference_raw);
-		try!(send.write(&reference_raw));
-		Ok(result)
+		let mut check_vec_raw = vec![0u8; input_len.iter().max().unwrap()*SecpOrd::NBYTES];
+		for ii in 0..*input_len.iter().max().unwrap() {
+			check_vec[ii].to_bytes(&mut check_vec_raw[(ii*SecpOrd::NBYTES)..((ii+1)*SecpOrd::NBYTES)]);
+		}
+		send.write(&check_vec_raw)?;
+
+		let mut references_raw = vec![0u8;input_count * SecpOrd::NBYTES];
+		for kk in 0..input_count {
+			let reference = input_correlation[kk].mul(&coefs[kk]).add(&check_alpha[kk].mul(&check_coefs[kk]));	
+			reference.to_bytes(&mut references_raw[(kk*SecpOrd::NBYTES)..((kk+1)*SecpOrd::NBYTES)]);
+		}
+		send.write(&references_raw)?;
+
+		Ok(vals0)
 	}
 }
 
 impl OTERecver {
-	pub fn new<T1:Read, T2:Write>(rng: &mut Rng, recv:&mut T1, send: &mut T2) -> Result<OTERecver,MPECDSAError> {
-		//ROT sender goes first, so we let the OTExt recver choose the public random vector to reduce rounds.
-		let mut publicrandomvec = [SecpOrd::ZERO;ENCODING_SEC_PARAM+SecpOrd::NBITS];
-		let mut raw_nonce = [0u8;SecpOrd::NBYTES];
-		let mut prv_element = [0u8;SecpOrd::NBYTES];
-		let mut nonce = SecpOrd::rand(rng);
-		nonce.to_bytes(&mut raw_nonce);
-		try!(send.write(&raw_nonce));
-		for ii in 0..ENCODING_SEC_PARAM+SecpOrd::NBITS {
-			nonce = nonce.add(&SecpOrd::ONE);
-			nonce.to_bytes(&mut raw_nonce);
-			hash(&mut prv_element, &raw_nonce);
-			publicrandomvec[ii] = SecpOrd::from_bytes(&prv_element);
-		}
-
+	pub fn new<T1:Read, T2:Write>(ro: &DyadicROTagger, rng: &mut dyn Rng, recv:&mut T1, send: &mut T2) -> Result<OTERecver,MPECDSAError> {
+		let seeds = rot_send_batch(SecpOrd::NBITS, &ro, rng, recv, send)?;
 		Ok(OTERecver {
-			publicrandomvec: publicrandomvec,
-			seeds: try!(rot_send_batch(SecpOrd::NBITS, rng, recv, send)),
-			//extindex: AtomicUsize::new(0),
-			//transindex: AtomicUsize::new(0)
+			seeds: seeds
 		})
 	}
 
-	pub fn mul_encode_and_extend<T:Write>(&self, extindex: usize, inputs_beta: &[SecpOrd], rng: &mut Rng, send: &mut T) 
-										 -> Result<(Vec<[bool;2*SecpOrd::NBITS]>,[bool;ENCODING_SEC_PARAM],Vec<[u8;2*SecpOrd::NBITS*HASH_SIZE]>,[u8;ENCODING_SEC_PARAM*HASH_SIZE]),MPECDSAError> {
-		debug_assert!(SecpOrd::NBYTES == HASH_SIZE);
 
-		// Encode phase
-		let mut encoding_private_bits = [false; ENCODING_SEC_PARAM];
-		let mut encoding_private_offset = SecpOrd::ZERO;
-		for ii in 0..ENCODING_SEC_PARAM {
-			encoding_private_bits[ii] = (rng.next_u32() % 2) > 0;
-			let potential_offset = encoding_private_offset.add(&self.publicrandomvec[SecpOrd::NBITS+ii]);
-			if encoding_private_bits[ii] {
-				encoding_private_offset = potential_offset;
-			}
-		}
+	pub fn extend<T:Write>(&self, choice_bits_in:&[bool], ro: &DyadicROTagger, rng: &mut dyn Rng, send: &mut T) -> Result<Vec<u8>,MPECDSAError> {
 
-		let mut encoding_private_element_bits = vec![[false; SecpOrd::NBITS]; inputs_beta.len()];
-		let mut encoding_private_element_offsets = vec![SecpOrd::ZERO; inputs_beta.len()];
-		for jj in 0..inputs_beta.len() {
-			for ii in 0..SecpOrd::NBITS {
-				encoding_private_element_bits[jj][ii] = (rng.next_u32() % 2) > 0;
-				let potential_offset = encoding_private_element_offsets[jj].add(&self.publicrandomvec[ii]);
-				if encoding_private_element_bits[jj][ii] {
-					encoding_private_element_offsets[jj] = potential_offset;
-				}
-			}
-		}
-
-		let mut inputs_encoded: Vec<[bool;2*SecpOrd::NBITS]> = Vec::with_capacity(inputs_beta.len());
-		let mut choice_bits: Vec<bool> = Vec::with_capacity(inputs_beta.len()*2*SecpOrd::NBITS + ENCODING_SEC_PARAM + OT_SEC_PARAM);
-		for ii in 0..inputs_beta.len() {
-			inputs_encoded.push([false;2*SecpOrd::NBITS]);
-			let beta_aug = inputs_beta[ii].sub(&encoding_private_offset).sub(&encoding_private_element_offsets[ii]);
-			for jj in 0..SecpOrd::NBYTES {
-				inputs_encoded[ii][jj*8+0] = beta_aug.bit(SecpOrd::NBITS - ((jj+1)*8) + 0);
-				inputs_encoded[ii][jj*8+1] = beta_aug.bit(SecpOrd::NBITS - ((jj+1)*8) + 1);
-				inputs_encoded[ii][jj*8+2] = beta_aug.bit(SecpOrd::NBITS - ((jj+1)*8) + 2);
-				inputs_encoded[ii][jj*8+3] = beta_aug.bit(SecpOrd::NBITS - ((jj+1)*8) + 3);
-				inputs_encoded[ii][jj*8+4] = beta_aug.bit(SecpOrd::NBITS - ((jj+1)*8) + 4);
-				inputs_encoded[ii][jj*8+5] = beta_aug.bit(SecpOrd::NBITS - ((jj+1)*8) + 5);
-				inputs_encoded[ii][jj*8+6] = beta_aug.bit(SecpOrd::NBITS - ((jj+1)*8) + 6);
-				inputs_encoded[ii][jj*8+7] = beta_aug.bit(SecpOrd::NBITS - ((jj+1)*8) + 7);
-			}
-			inputs_encoded[ii][SecpOrd::NBITS..].copy_from_slice(&encoding_private_element_bits[ii]);
-			choice_bits.extend_from_slice(&inputs_encoded[ii]);
-		}
-		choice_bits.extend_from_slice(&encoding_private_bits);
+		let mut choice_bits: Vec<bool> = Vec::with_capacity(choice_bits_in.len() + OT_SEC_PARAM);
+		choice_bits.extend_from_slice(&choice_bits_in);
 
 		for _ in 0..OT_SEC_PARAM {
 			choice_bits.push((rng.next_u32() % 2) > 0);
@@ -418,11 +364,12 @@ impl OTERecver {
 		}
 
 		// Extend phase
-		//let extindex = self.extindex.fetch_add(1, Ordering::Relaxed);
-		let prgoutputlen = inputs_beta.len()*2*SecpOrd::NBITS + ENCODING_SEC_PARAM + OT_SEC_PARAM;
+		let prgoutputlen = choice_bits.len();
 		let mut expanded_seeds0: Vec<u8> = Vec::with_capacity(SecpOrd::NBYTES * prgoutputlen);
 		let mut expanded_seeds1: Vec<u8> = Vec::with_capacity(SecpOrd::NBYTES * prgoutputlen);
 		let prgiterations = ((prgoutputlen/8) + HASH_SIZE - 1) / HASH_SIZE;
+
+		let mut tagrange = ro.allocate_dyadic_range((SecpOrd::NBITS*prgiterations + prgoutputlen + 1) as u64);
 
 		debug_assert!((SecpOrd::NBYTES * prgoutputlen)%HASH_SIZE ==0);
 
@@ -430,16 +377,17 @@ impl OTERecver {
 		let mut hasherinput = vec![0u8; 2*HASH_BLOCK_SIZE*prgiterations*SecpOrd::NBITS];
 		for ii in 0..SecpOrd::NBITS {
 			for jj in 0..prgiterations {
-				LittleEndian::write_u64(&mut hasherinput[((ii*prgiterations+jj) * HASH_BLOCK_SIZE + HASH_SIZE)..((ii*prgiterations+jj) * HASH_BLOCK_SIZE + HASH_SIZE + 8)], extindex as u64);
-				LittleEndian::write_u64(&mut hasherinput[((ii*prgiterations+jj) * HASH_BLOCK_SIZE + HASH_SIZE + 8)..((ii*prgiterations+jj) * HASH_BLOCK_SIZE + HASH_SIZE + 16)], (jj*SecpOrd::NBITS + ii) as u64);
-				LittleEndian::write_u64(&mut hasherinput[(HASH_BLOCK_SIZE*prgiterations*SecpOrd::NBITS + (ii*prgiterations+jj) * HASH_BLOCK_SIZE + HASH_SIZE)..(HASH_BLOCK_SIZE*prgiterations*SecpOrd::NBITS + (ii*prgiterations+jj) * HASH_BLOCK_SIZE + HASH_SIZE + 8)], extindex as u64);
-				LittleEndian::write_u64(&mut hasherinput[(HASH_BLOCK_SIZE*prgiterations*SecpOrd::NBITS + (ii*prgiterations+jj) * HASH_BLOCK_SIZE + HASH_SIZE + 8)..(HASH_BLOCK_SIZE*prgiterations*SecpOrd::NBITS + (ii*prgiterations+jj) * HASH_BLOCK_SIZE + HASH_SIZE + 16)], (jj*SecpOrd::NBITS + ii) as u64);
-				hasherinput[((ii*prgiterations+jj) * HASH_BLOCK_SIZE)..((ii*prgiterations+jj) * HASH_BLOCK_SIZE + HASH_SIZE)].copy_from_slice(&self.seeds[ii].0);
-				hasherinput[(HASH_BLOCK_SIZE*prgiterations*SecpOrd::NBITS + (ii*prgiterations+jj) * HASH_BLOCK_SIZE)..(HASH_BLOCK_SIZE*prgiterations*SecpOrd::NBITS + (ii*prgiterations+jj) * HASH_BLOCK_SIZE + HASH_SIZE)].copy_from_slice(&self.seeds[ii].1);
+				// Map for (ii,jj): [ 20B: RO tag | 32B: seed[ii].0 ], total: 52B
+				// Map for (HASH_BLOCK_SIZE*prgiterations*SecpOrd::NBITS+ii,jj): [ 20B RO tag | 32B: seed[ii].1 ], total: 52B
+				let tag = tagrange.next()?;
+				hasherinput[((ii*prgiterations+jj) * HASH_BLOCK_SIZE)..((ii*prgiterations+jj) * HASH_BLOCK_SIZE + RO_TAG_SIZE)].copy_from_slice(&tag[..]);
+				hasherinput[((ii*prgiterations+jj) * HASH_BLOCK_SIZE + RO_TAG_SIZE)..((ii*prgiterations+jj) * HASH_BLOCK_SIZE + RO_TAG_SIZE + HASH_SIZE)].copy_from_slice(&self.seeds[ii].0);
+				hasherinput[(HASH_BLOCK_SIZE*prgiterations*SecpOrd::NBITS + (ii*prgiterations+jj) * HASH_BLOCK_SIZE)..(HASH_BLOCK_SIZE*prgiterations*SecpOrd::NBITS + (ii*prgiterations+jj) * HASH_BLOCK_SIZE + RO_TAG_SIZE)].copy_from_slice(&tag[..]);
+				hasherinput[(HASH_BLOCK_SIZE*prgiterations*SecpOrd::NBITS + (ii*prgiterations+jj) * HASH_BLOCK_SIZE + RO_TAG_SIZE)..(HASH_BLOCK_SIZE*prgiterations*SecpOrd::NBITS + (ii*prgiterations+jj) * HASH_BLOCK_SIZE + RO_TAG_SIZE + HASH_SIZE)].copy_from_slice(&self.seeds[ii].1);
 			}
 		}
 
-		sha256_multi(&hasherinput, &mut prgoutput, 2*SecpOrd::NBITS*prgiterations);
+		hash_multi(&hasherinput, &mut prgoutput, 2*SecpOrd::NBITS*prgiterations);
 
 		for ii in 0..SecpOrd::NBITS {
 			expanded_seeds0.extend_from_slice(&prgoutput[(ii*prgiterations*HASH_SIZE)..(ii*prgiterations*HASH_SIZE+prgoutputlen/8)]);
@@ -450,20 +398,22 @@ impl OTERecver {
 
 		debug_assert!(expanded_seeds0.len()/compressed_choice_bits.len() == SecpOrd::NBITS);
 
-		let mut seeds_combined: Vec<u8> = Vec::with_capacity(SecpOrd::NBYTES * prgoutputlen);
+		let mut seeds_combined = vec![0u8;SecpOrd::NBYTES * prgoutputlen + RO_TAG_SIZE];
 		for ii in 0..expanded_seeds0.len() {
-			seeds_combined.push(expanded_seeds0[ii] ^ expanded_seeds1[ii] ^ compressed_choice_bits[ii%compressed_choice_bits.len()]);
+			seeds_combined[ii] = expanded_seeds0[ii] ^ expanded_seeds1[ii] ^ compressed_choice_bits[ii%compressed_choice_bits.len()];
 		}
 
 		let mut random_samples = vec![0u8; HASH_SIZE * prgoutputlen];
 		let mut seeds_shortened = [0u8;HASH_SIZE];
 		let mut hash_input = vec![0u8;HASH_BLOCK_SIZE*prgoutputlen];
+		seeds_combined[(SecpOrd::NBYTES * prgoutputlen)..].copy_from_slice(&tagrange.next()?[..]);
 		hash(&mut seeds_shortened, &seeds_combined);
 		for ii in 0..prgoutputlen {
-			hash_input[(ii*HASH_BLOCK_SIZE)..(ii*HASH_BLOCK_SIZE+HASH_SIZE)].copy_from_slice(&seeds_shortened);
-			LittleEndian::write_u64(&mut hash_input[(ii*HASH_BLOCK_SIZE+HASH_SIZE)..(ii*HASH_BLOCK_SIZE+HASH_SIZE+8)], ii as u64);
+			// Map for ii: [ 20B RO tag | 32B: seeds_shortened ], total: 52B
+			hash_input[(ii*HASH_BLOCK_SIZE)..(ii*HASH_BLOCK_SIZE+RO_TAG_SIZE)].copy_from_slice(&tagrange.next()?[..]);
+			hash_input[(ii*HASH_BLOCK_SIZE + RO_TAG_SIZE)..(ii*HASH_BLOCK_SIZE+RO_TAG_SIZE+HASH_SIZE)].copy_from_slice(&seeds_shortened);
 		}
-		sha256_multi(&hash_input, &mut random_samples, prgoutputlen);
+		hash_multi(&hash_input, &mut random_samples, prgoutputlen);
 
 		debug_assert!(expanded_seeds0.len() == transposed_seed0.len());
 		debug_assert!(transposed_seed0.len() == random_samples.len());
@@ -482,130 +432,159 @@ impl OTERecver {
 		}
 
 		let mut bufsend = BufWriter::new(send);
-		try!(bufsend.write(&seeds_combined));
-		try!(bufsend.write(&sampled_bits));
-		try!(bufsend.write(&sampled_seeds));
+		bufsend.write(&seeds_combined[0..SecpOrd::NBYTES * prgoutputlen])?;
+		bufsend.write(&sampled_bits)?;
+		bufsend.write(&sampled_seeds)?;
 
-		//finally, collate the output
-		let mut transposed_seed_fragments:Vec<[u8;2*SecpOrd::NBITS*HASH_SIZE]> = Vec::with_capacity(inputs_beta.len());
-		for ii in 0..inputs_beta.len() {
-			let mut fragment = [0u8;2*SecpOrd::NBITS * HASH_SIZE];
-			fragment.copy_from_slice(&transposed_seed0[(ii * 2*SecpOrd::NBITS * HASH_SIZE)..((ii+1) * 2*SecpOrd::NBITS * HASH_SIZE)]);
-			transposed_seed_fragments.push(fragment);
-		}
-		let mut transposed_seed_encoding_fragment = [0u8;ENCODING_SEC_PARAM * HASH_SIZE];
-		transposed_seed_encoding_fragment.copy_from_slice(&transposed_seed0[(inputs_beta.len() * 2*SecpOrd::NBITS * HASH_SIZE)..(inputs_beta.len() * 2*SecpOrd::NBITS * HASH_SIZE + ENCODING_SEC_PARAM * HASH_SIZE)]);
-
-		Ok((inputs_encoded,
-			encoding_private_bits,
-			transposed_seed_fragments,
-			transposed_seed_encoding_fragment))
+		Ok(transposed_seed0)
 	}
 
-	pub fn  mul_transfer<T:Read>(&self, transindex: usize, input_beta_encoded: &[bool;2*SecpOrd::NBITS], encoding_private_bits: &[bool;ENCODING_SEC_PARAM], transposed_seed_fragment: &[u8;2*SecpOrd::NBITS*HASH_SIZE], transposed_seed_encoding_fragment: &[u8;ENCODING_SEC_PARAM*HASH_SIZE], recv: &mut T) -> Result<SecpOrd,MPECDSAError> {
-		//let transindex = self.transindex.fetch_add(1, Ordering::Relaxed);
 
-		let gadget_table = match SecpOrd::NBITS {
-			256 => &precomp::GADGET_TABLE_256,
-			_ => { return Err(MPECDSAError::General); }
-		};
+	pub fn  transfer<T:Read>(&self, choice_bits: &[&[bool]], transposed_seed: &[&[u8]], ro: &DyadicROTagger, recv: &mut T) -> Result<Vec<Vec<SecpOrd>>,MPECDSAError> {
+		let input_count = choice_bits.len();
+		let total_input_len = choice_bits.iter().map(|x| x.len()).sum();
+		let mut tagrange = ro.allocate_dyadic_range((2*total_input_len + 2*input_count + 2) as u64);
 
-		let mut transposed_seed = [0u8;(2*SecpOrd::NBITS+ENCODING_SEC_PARAM)*HASH_SIZE];
-		transposed_seed[0..(HASH_SIZE*2*SecpOrd::NBITS)].copy_from_slice(transposed_seed_fragment);
-		transposed_seed[(HASH_SIZE*2*SecpOrd::NBITS)..(2*SecpOrd::NBITS+ENCODING_SEC_PARAM)*HASH_SIZE].copy_from_slice(transposed_seed_encoding_fragment);
-		let mut choice_bits = [false;2*SecpOrd::NBITS + ENCODING_SEC_PARAM];
-		choice_bits[0..2*SecpOrd::NBITS].copy_from_slice(input_beta_encoded);
-		choice_bits[2*SecpOrd::NBITS..2*SecpOrd::NBITS + ENCODING_SEC_PARAM].copy_from_slice(encoding_private_bits);
-
-		let mut hasherinput = [0u8; (2*SecpOrd::NBITS + ENCODING_SEC_PARAM) * HASH_BLOCK_SIZE];
-		let mut hashoutput = [0u8; (2*SecpOrd::NBITS + ENCODING_SEC_PARAM) * HASH_SIZE];
-		let mut check_hashoutput = [0u8; (2*SecpOrd::NBITS + ENCODING_SEC_PARAM) * HASH_SIZE];
+		let mut hasherinput = vec![0u8; total_input_len * HASH_BLOCK_SIZE];
+		let mut hashoutput = vec![0u8; total_input_len * HASH_SIZE];
+		let mut check_hashoutput = vec![0u8; total_input_len * HASH_SIZE];
 		
-		for ii in 0..(2*SecpOrd::NBITS + ENCODING_SEC_PARAM) {
-			LittleEndian::write_u64(&mut hasherinput[(ii * HASH_BLOCK_SIZE + HASH_SIZE)..(ii * HASH_BLOCK_SIZE + HASH_SIZE + 8)], (2*transindex) as u64);
-			LittleEndian::write_u64(&mut hasherinput[(ii * HASH_BLOCK_SIZE + HASH_SIZE + 8)..(ii * HASH_BLOCK_SIZE + HASH_SIZE + 16)], ii as u64);
-			hasherinput[(ii * HASH_BLOCK_SIZE)..(ii * HASH_BLOCK_SIZE + HASH_SIZE)].copy_from_slice(&transposed_seed[(ii*HASH_SIZE)..((ii+1)*HASH_SIZE)]);
+		let mut input_len_offset = 0;
+		for kk in 0..input_count {
+			let localhasherinput = &mut hasherinput[(input_len_offset*HASH_BLOCK_SIZE)..((input_len_offset + choice_bits[kk].len())*HASH_BLOCK_SIZE)];
+
+			for ii in 0..choice_bits[kk].len() {
+				// Map for ii: [ 20B RO tag | 32B: transposed_seed[ii] ], total: 52B
+				localhasherinput[(ii * HASH_BLOCK_SIZE)..(ii * HASH_BLOCK_SIZE + RO_TAG_SIZE)].copy_from_slice(&tagrange.next()?[..]);
+				localhasherinput[(ii * HASH_BLOCK_SIZE + RO_TAG_SIZE)..(ii * HASH_BLOCK_SIZE + RO_TAG_SIZE + HASH_SIZE)].copy_from_slice(&transposed_seed[kk][(ii*HASH_SIZE)..((ii+1)*HASH_SIZE)]);
+			}
+			input_len_offset = input_len_offset + choice_bits[kk].len();
 		}
 
-		sha256_multi(&hasherinput, &mut hashoutput, 2*SecpOrd::NBITS + ENCODING_SEC_PARAM);
+		hash_multi(&hasherinput, &mut hashoutput, total_input_len);
 
-		for ii in 0..(2*SecpOrd::NBITS + ENCODING_SEC_PARAM) {
-			LittleEndian::write_u64(&mut hasherinput[(ii * HASH_BLOCK_SIZE + HASH_SIZE)..(ii * HASH_BLOCK_SIZE + HASH_SIZE + 8)], (2*transindex+1) as u64);
+		for ii in 0..total_input_len {
+			// Map for ii: [ 20B RO tag | 32B: transposed_seed[ii] ], total: 52B
+			hasherinput[(ii * HASH_BLOCK_SIZE)..(ii * HASH_BLOCK_SIZE + RO_TAG_SIZE)].copy_from_slice(&tagrange.next()?[..]);
 		}
 
-		sha256_multi(&hasherinput, &mut check_hashoutput, 2*SecpOrd::NBITS + ENCODING_SEC_PARAM);
+		hash_multi(&hasherinput, &mut check_hashoutput, total_input_len);
 
-		let mut correction_vec_raw = [0u8; (2*SecpOrd::NBITS + ENCODING_SEC_PARAM)*SecpOrd::NBYTES];
-		try!(recv.read_exact(&mut correction_vec_raw));
-		let mut coef = [0u8;HASH_SIZE];
-		hash(&mut coef, &correction_vec_raw);
-		let coef = SecpOrd::from_bytes(&coef);
-		let mut vals = [SecpOrd::ZERO; 2*SecpOrd::NBITS + ENCODING_SEC_PARAM];
-		let mut result = SecpOrd::ZERO;
-		for ii in 0..(2*SecpOrd::NBITS + ENCODING_SEC_PARAM) {
-			let cv = SecpOrd::from_bytes(&correction_vec_raw[(ii*SecpOrd::NBYTES)..((ii+1)*SecpOrd::NBYTES)]);
-			let val = SecpOrd::from_bytes(&hashoutput[(ii*HASH_SIZE)..((ii+1)*HASH_SIZE)]).neg();
-			let val_aug = val.add(&cv);
-			vals[ii] = if choice_bits[ii] {
-				val_aug
-			} else {
-				val
-			};
+		let mut correction_vec_raw = vec![0u8; total_input_len*SecpOrd::NBYTES + RO_TAG_SIZE];
+		recv.read_exact(&mut correction_vec_raw[0..total_input_len*SecpOrd::NBYTES])?;
+		correction_vec_raw[total_input_len*SecpOrd::NBYTES..].copy_from_slice(&tagrange.next()?[..]);
 
-			let offset = if ii < SecpOrd::NBITS {
-				&gadget_table[SecpOrd::NBITS - (ii/8)*8 -8 + (ii%8)]
-			} else {
-				&self.publicrandomvec[(ii/8)*8-SecpOrd::NBITS+ii%8]
-			};
-			result = result.add(&vals[ii].mul(offset));
+		let mut coef_seed = [0u8;HASH_SIZE+RO_TAG_SIZE];
+		let mut coef_raw = [0u8;HASH_SIZE];
+		let mut coefs = vec![SecpOrd::ZERO;input_count];
+		hash(&mut coef_raw, &correction_vec_raw);
+
+		coef_seed[0..HASH_SIZE].copy_from_slice(&coef_raw);
+		for kk in 0..input_count {
+			coef_seed[HASH_SIZE..].copy_from_slice(&tagrange.next()?[..]);
+			hash(&mut coef_raw, &coef_seed);
+			coefs[kk] = SecpOrd::from_bytes(&coef_raw);
 		}
 
-		let mut check_correction_vec_raw = [0u8; (2*SecpOrd::NBITS + ENCODING_SEC_PARAM)*SecpOrd::NBYTES];
-		try!(recv.read_exact(&mut check_correction_vec_raw));
-		let mut check_coef = [0u8;HASH_SIZE];
-		hash(&mut check_coef, &check_correction_vec_raw);
-		let check_coef = SecpOrd::from_bytes(&check_coef);
-		let mut check_vals = [SecpOrd::ZERO; 2*SecpOrd::NBITS + ENCODING_SEC_PARAM];
-		for ii in 0..(2*SecpOrd::NBITS + ENCODING_SEC_PARAM) {
-			let ccv = SecpOrd::from_bytes(&check_correction_vec_raw[(ii*SecpOrd::NBYTES)..((ii+1)*SecpOrd::NBYTES)]);
-			let check_val = SecpOrd::from_bytes(&check_hashoutput[(ii*HASH_SIZE)..((ii+1)*HASH_SIZE)]).neg();
-			let check_val_aug = check_val.add(&ccv);
-			check_vals[ii] = if choice_bits[ii] {
-				check_val_aug
-			} else {
-				check_val
-			};
+		let mut vals: Vec<Vec<SecpOrd>> = Vec::with_capacity(input_count);
+		let mut vals_offset = 0;
+		for kk in 0..input_count {
+			let mut localvals = vec![SecpOrd::ZERO; choice_bits[kk].len()];
+			let localhashoutput = &hashoutput[(vals_offset*HASH_SIZE)..((vals_offset+choice_bits[kk].len())*HASH_SIZE)];
+			let localcorrectionvec = &mut correction_vec_raw[(vals_offset*SecpOrd::NBYTES)..((vals_offset+choice_bits[kk].len())*SecpOrd::NBYTES)];
+
+			for ii in 0..choice_bits[kk].len() {
+				let cv = SecpOrd::from_bytes(&localcorrectionvec[(ii*SecpOrd::NBYTES)..((ii+1)*SecpOrd::NBYTES)]);
+				let val = SecpOrd::from_bytes(&localhashoutput[(ii*HASH_SIZE)..((ii+1)*HASH_SIZE)]).neg();
+				let val_aug = val.add(&cv);
+				localvals[ii] = if choice_bits[kk][ii] {
+					val_aug
+				} else {
+					val
+				};
+			}
+			vals.push(localvals);
+			vals_offset = vals_offset + choice_bits[kk].len();
+		}	
+
+		let mut check_correction_vec_raw = vec![0u8; total_input_len*SecpOrd::NBYTES + RO_TAG_SIZE];
+		check_correction_vec_raw[total_input_len*SecpOrd::NBYTES..].copy_from_slice(&tagrange.next()?[..]);
+		recv.read_exact(&mut check_correction_vec_raw[0..total_input_len*SecpOrd::NBYTES])?;
+		
+
+		let mut check_coef_seed = [0u8;HASH_SIZE+RO_TAG_SIZE];
+		let mut check_coef_raw = [0u8;HASH_SIZE];
+		let mut check_coefs = vec![SecpOrd::ZERO;input_count];
+		hash(&mut check_coef_raw, &check_correction_vec_raw);
+		check_coef_seed[0..HASH_SIZE].copy_from_slice(&check_coef_raw);
+
+		for kk in 0..input_count {
+			check_coef_seed[HASH_SIZE..].copy_from_slice(&tagrange.next()?[..]);
+			hash(&mut check_coef_raw, &check_coef_seed);
+			check_coefs[kk] = SecpOrd::from_bytes(&check_coef_raw);
+		}
+
+		let mut check_vals: Vec<Vec<SecpOrd>> = Vec::with_capacity(input_count);
+		vals_offset = 0;
+		for kk in 0..input_count {
+			let mut localcheckvals = vec![SecpOrd::ZERO; choice_bits[kk].len()];
+			let localcheckhashoutput = &check_hashoutput[(vals_offset*HASH_SIZE)..((vals_offset+choice_bits[kk].len())*HASH_SIZE)];
+			let localcheckcorrectionvec = &mut check_correction_vec_raw[(vals_offset*SecpOrd::NBYTES)..((vals_offset+choice_bits[kk].len())*SecpOrd::NBYTES)];
+
+			for ii in 0..choice_bits[kk].len() {
+				let ccv = SecpOrd::from_bytes(&localcheckcorrectionvec[(ii*SecpOrd::NBYTES)..((ii+1)*SecpOrd::NBYTES)]);
+				let check_val = SecpOrd::from_bytes(&localcheckhashoutput[(ii*HASH_SIZE)..((ii+1)*HASH_SIZE)]).neg();
+				let check_val_aug = check_val.add(&ccv);
+				localcheckvals[ii] = if choice_bits[kk][ii] {
+					check_val_aug
+				} else {
+					check_val
+				};
+			}
+			check_vals.push(localcheckvals);
+			vals_offset = vals_offset + choice_bits[kk].len();
 		}
 			
-		let mut check_vec_raw = [0u8; (2*SecpOrd::NBITS + ENCODING_SEC_PARAM) * SecpOrd::NBYTES];
-		try!(recv.read_exact(&mut check_vec_raw));
-		let mut reference_raw = [0u8;SecpOrd::NBYTES];
-		try!(recv.read_exact(&mut reference_raw));
-		let reference = SecpOrd::from_bytes(&reference_raw);
+		let mut check_vec_raw = vec![0u8; choice_bits.iter().map(|x| x.len()).max().unwrap() * SecpOrd::NBYTES];
+		recv.read_exact(&mut check_vec_raw)?;
+		let mut references: Vec<SecpOrd> = Vec::with_capacity(input_count);
+		for _ in 0..input_count {
+			let mut reference_raw = [0u8;SecpOrd::NBYTES];
+			recv.read_exact(&mut reference_raw)?;
+			references.push(SecpOrd::from_bytes(&reference_raw));	
+		}
+	
+		for ii in 0..choice_bits.iter().map(|x| x.len()).max().unwrap() {
+			let mut rhs = SecpOrd::from_bytes(&check_vec_raw[(ii*SecpOrd::NBYTES)..((ii+1)*SecpOrd::NBYTES)]).neg();
+			let mut lhs = SecpOrd::ZERO;
+			for kk in 0..input_count {
+				rhs = rhs.add(&if (ii < choice_bits[kk].len()) && (choice_bits[kk][ii]) {
+					references[kk]
+				} else {
+					SecpOrd::ZERO
+				});
 
-		for ii in 0..(2*SecpOrd::NBITS + ENCODING_SEC_PARAM) {
-			let check_vec = SecpOrd::from_bytes(&check_vec_raw[(ii*SecpOrd::NBYTES)..((ii+1)*SecpOrd::NBYTES)]).neg();
-			let check_vec_aug = check_vec.add(&reference);
-			let check_vec_chosen = if choice_bits[ii] {
-				check_vec_aug
-			} else {
-				check_vec
-			};
+				lhs = lhs.add(&if ii < choice_bits[kk].len() {
+					vals[kk][ii].mul(&coefs[kk]).add(&check_vals[kk][ii].mul(&check_coefs[kk]))
+				} else {
+					SecpOrd::ZERO
+				});
+			}
 
-			if vals[ii].mul(&coef).add(&check_vals[ii].mul(&check_coef)) != check_vec_chosen {
-				return Err(MPECDSAError::Proof(ProofError::new("Verification Failed for OT-Mul (sender cheated)")))
+			if lhs != rhs {
+				return Err(MPECDSAError::Proof(ProofError::new("Verification Failed for OTE (sender cheated)")))
 			}
 		}
-		Ok(result)
+		Ok(vals)
 	}
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use std::{thread, time};
-	use std::net::{TcpListener, TcpStream};
-	use test::Bencher;
+	use super::channelstream::*;
+	use std::thread;
+	use byteorder::{ByteOrder, LittleEndian};
 
 	#[test]
 	fn test_transpose8x8() {
@@ -623,10 +602,8 @@ mod tests {
 
 	#[test]
 	fn test_transpose() {
-		let mut a: Vec<u8> = Vec::with_capacity(16);
-		a.resize_default(16);
-		let mut at: Vec<u8> = Vec::with_capacity(16);
-		at.resize_default(16);
+		let mut a: Vec<u8> = vec![0u8;16];
+		let mut at: Vec<u8> = vec![0u8;16];
 		LittleEndian::write_u64(&mut a[0..8], 0b0111101001111010000111010001110100010001000100010111010001110100);
 		LittleEndian::write_u64(&mut a[8..16], 0b0000101000001010000000010000000100101111001011111111111111111111);
 
@@ -638,35 +615,38 @@ mod tests {
 	}
 
 	#[test]
-	fn test_ote_setup_net() {
+	fn test_ote_setup() {
+		let (mut sendvec, mut recvvec) = spawn_n2_channelstreams(2);
+
+		let mut s1 = sendvec.remove(0);
+		let mut r1 = recvvec.remove(0);
+
+		let mut s2 = sendvec.remove(0);
+		let mut r2 = recvvec.remove(0);
+
 		let child = thread::spawn(move || {
 			let mut rng = rand::thread_rng();
-			let listener = TcpListener::bind("127.0.0.1:4569").unwrap_or_else(|e| { panic!(e) });
 
-			let mut streamrecv = match listener.accept() {
-				Ok((stream, _)) => {
-					stream
-				},
-				Err(e) => panic!("couldn't get client: {:?}", e),
+			let ro = {
+				let mut r1ref = r1.iter_mut().map(|x| if x.is_some() { x.as_mut() } else { None }).collect::<Vec<Option<&mut _>>>();
+				let mut s1ref = s1.iter_mut().map(|x| if x.is_some() { x.as_mut() } else { None }).collect::<Vec<Option<&mut _>>>();
+				GroupROTagger::from_network_unverified(0, &mut rng, &mut r1ref[..], &mut s1ref[..]).unwrap()
 			};
-
-			let mut streamsend = streamrecv.try_clone().unwrap();
-			let sender = OTESender::new(&mut rng, &mut streamrecv, &mut streamsend).unwrap();
+			let sender = OTESender::new(&ro.get_dyadic_tagger(1).unwrap(), &mut rng, r1[1].as_mut().unwrap(), s1[1].as_mut().unwrap()).unwrap();
 			sender
 		});
 
-		thread::sleep(time::Duration::from_millis(50));
-
 		let mut rng = rand::thread_rng();
-		let mut streamrecv = TcpStream::connect("127.0.0.1:4569").unwrap();
-		let mut streamsend = streamrecv.try_clone().unwrap();
-
-		let recver = OTERecver::new(&mut rng, &mut streamrecv, &mut streamsend).unwrap();
+		
+		let ro = {
+			let mut r2ref = r2.iter_mut().map(|x| if x.is_some() { x.as_mut() } else { None }).collect::<Vec<Option<&mut _>>>();
+			let mut s2ref = s2.iter_mut().map(|x| if x.is_some() { x.as_mut() } else { None }).collect::<Vec<Option<&mut _>>>();
+			GroupROTagger::from_network_unverified(1, &mut rng, &mut r2ref[..], &mut s2ref[..]).unwrap()
+		};
+		let recver = OTERecver::new(&ro.get_dyadic_tagger(0).unwrap(), &mut rng, r2[0].as_mut().unwrap(), s2[0].as_mut().unwrap()).unwrap();
 
 		let sender = child.join().unwrap();
-		for ii in 0..recver.publicrandomvec.len() {
-			assert_eq!(recver.publicrandomvec[ii], sender.publicrandomvec[ii]);
-		}
+		assert!(sender.correlation.len()>0);
 		for ii in 0..sender.correlation.len() {
 			assert_eq!(sender.seeds[ii], if sender.correlation[ii] {
 				recver.seeds[ii].1
@@ -676,346 +656,4 @@ mod tests {
 		}
 	}
 
-	#[test]
-	fn test_ote_mul_extend_net() {
-		let child = thread::spawn(move || {
-			let mut rng = rand::thread_rng();
-			let listener = TcpListener::bind("127.0.0.1:4570").unwrap_or_else(|e| { panic!(e) });
-
-			let mut streamrecv = match listener.accept() {
-				Ok((stream, _)) => {
-					stream
-				},
-				Err(e) => panic!("couldn't get client: {:?}", e),
-			};
-
-			let mut streamsend = streamrecv.try_clone().unwrap();
-			let sender = OTESender::new(&mut rng, &mut streamrecv, &mut streamsend).unwrap();
-			sender.mul_extend(0, 2, &mut streamrecv)
-		});
-
-		thread::sleep(time::Duration::from_millis(50));
-
-		let mut rng = rand::thread_rng();
-		let mut streamrecv = TcpStream::connect("127.0.0.1:4570").unwrap();
-		let mut streamsend = streamrecv.try_clone().unwrap();
-
-		let recver = OTERecver::new(&mut rng, &mut streamrecv, &mut streamsend).unwrap();
-		let mut beta:Vec<SecpOrd> = Vec::with_capacity(2);
-		for _ in 0..2 {
-			beta.push(SecpOrd::rand(&mut rng));
-		}
-		let recver_result = recver.mul_encode_and_extend(0, &beta, &mut rng, &mut streamsend);
-		assert!(recver_result.is_ok());
-		let recver_result = recver_result.unwrap();
-
-		let mut encoding_offset = SecpOrd::ZERO;
-		for ii in 0..ENCODING_SEC_PARAM {
-			if recver_result.1[ii] {
-				encoding_offset = encoding_offset.add(&recver.publicrandomvec[SecpOrd::NBITS+ii]);
-			}
-		}
-
-		for ii in 0..recver_result.0.len() {
-			let el_bits = recver_result.0[ii];
-			let mut compressed_temp = [0u8; SecpOrd::NBYTES];
-			for jj in 0..SecpOrd::NBYTES {
-				compressed_temp[jj] = ((el_bits[jj*8+0] as u8) << 0)
-									| ((el_bits[jj*8+1] as u8) << 1)
-									| ((el_bits[jj*8+2] as u8) << 2)
-									| ((el_bits[jj*8+3] as u8) << 3)
-									| ((el_bits[jj*8+4] as u8) << 4)
-									| ((el_bits[jj*8+5] as u8) << 5)
-									| ((el_bits[jj*8+6] as u8) << 6)
-									| ((el_bits[jj*8+7] as u8) << 7);
-			}
-			let mut beta_temp = SecpOrd::from_bytes(&compressed_temp);
-			for jj in SecpOrd::NBITS..2*SecpOrd::NBITS {
-				if recver_result.0[ii][jj] {
-					beta_temp = beta_temp.add(&recver.publicrandomvec[jj-SecpOrd::NBITS]);
-				}
-			}
-			assert!(beta_temp.add(&encoding_offset)  == beta[ii]);
-		}
-
-		assert!(child.join().unwrap().is_ok());
-	}
-
-	#[test]
-	fn test_ote_mul_net() {
-		let mut rng = rand::thread_rng();
-		let mut alpha:Vec<SecpOrd> = Vec::with_capacity(10);
-		let mut alpha_child:Vec<SecpOrd> = Vec::with_capacity(10);
-		for ii in 0..10 {
-			alpha.push(SecpOrd::rand(&mut rng));
-			alpha_child.push(alpha[ii].clone());
-		}
-
-		let child = thread::spawn(move || {
-			let mut rng = rand::thread_rng();
-			let listener = TcpListener::bind("127.0.0.1:4572").unwrap_or_else(|e| { panic!(e) });
-
-			let mut streamrecv = match listener.accept() {
-				Ok((stream, _)) => {
-					stream
-				},
-				Err(e) => panic!("couldn't get client: {:?}", e),
-			};
-
-			let mut streamsend = streamrecv.try_clone().unwrap();
-			let sender = OTESender::new(&mut rng, &mut streamrecv, &mut streamsend).unwrap();
-			let extensions = sender.mul_extend(0, 10, &mut streamrecv).unwrap();
-			let mut results: Vec<SecpOrd> = Vec::with_capacity(10);
-			for ii in 0..10 {
-				results.push(sender.mul_transfer(ii, &alpha_child[ii], &extensions.0[ii], &extensions.1, &mut rng, &mut streamsend).unwrap());
-			}
-			results
-		});
-
-		thread::sleep(time::Duration::from_millis(50));
-		let mut streamrecv = TcpStream::connect("127.0.0.1:4572").unwrap();
-		let mut streamsend = streamrecv.try_clone().unwrap();
-
-		let recver = OTERecver::new(&mut rng, &mut streamrecv, &mut streamsend).unwrap();
-		let mut beta:Vec<SecpOrd> = Vec::with_capacity(10);
-		for _ in 0..10 {
-			beta.push(SecpOrd::rand(&mut rng));
-		}
-
-		let extensions = recver.mul_encode_and_extend(0, &beta, &mut rng, &mut streamsend).unwrap();
-		let mut results: Vec<SecpOrd> = Vec::with_capacity(10);
-		for ii in 0..10 {
-			results.push(recver.mul_transfer(ii, &extensions.0[ii], &extensions.1, &extensions.2[ii], &extensions.3, &mut streamrecv).unwrap());
-		}
-
-		let childresult: Vec<SecpOrd> = child.join().unwrap();
-		for ii in 0..10 {
-			assert_eq!(results[ii].add(&childresult[ii]), beta[ii].mul(&alpha[ii]));
-		}
-	}
-
-	#[test]
-	fn test_ote_multimul_net() {
-		let mut rng = rand::thread_rng();
-		let mut alpha:Vec<SecpOrd> = Vec::with_capacity(10);
-		let mut alpha_child:Vec<SecpOrd> = Vec::with_capacity(10);
-		for ii in 0..10 {
-			alpha.push(SecpOrd::rand(&mut rng));
-			alpha_child.push(alpha[ii].clone());
-		}
-
-		let child = thread::spawn(move || {
-			let mut rng = rand::thread_rng();
-			let listener = TcpListener::bind("127.0.0.1:4574").unwrap_or_else(|e| { panic!(e) });
-
-			let mut streamrecv = match listener.accept() {
-				Ok((stream, _)) => {
-					stream
-				},
-				Err(e) => panic!("couldn't get client: {:?}", e),
-			};
-
-			let mut streamsend = streamrecv.try_clone().unwrap();
-			let sender = OTESender::new(&mut rng, &mut streamrecv, &mut streamsend).unwrap();
-			let extensions = sender.mul_extend(0, 1, &mut streamrecv).unwrap();
-			let mut results: Vec<SecpOrd> = Vec::with_capacity(10);
-			for ii in 0..10 {
-				results.push(sender.mul_transfer(ii, &alpha_child[ii], &extensions.0[0], &extensions.1, &mut rng, &mut streamsend).unwrap());
-			}
-			results
-		});
-
-		thread::sleep(time::Duration::from_millis(50));
-		let mut streamrecv = TcpStream::connect("127.0.0.1:4574").unwrap();
-		let mut streamsend = streamrecv.try_clone().unwrap();
-
-		let recver = OTERecver::new(&mut rng, &mut streamrecv, &mut streamsend).unwrap();
-		let mut beta:Vec<SecpOrd> = Vec::with_capacity(1);
-		beta.push(SecpOrd::rand(&mut rng));
-
-		let extensions = recver.mul_encode_and_extend(0, &beta, &mut rng, &mut streamsend).unwrap();
-		let mut results: Vec<SecpOrd> = Vec::with_capacity(10);
-		for ii in 0..10 {
-			results.push(recver.mul_transfer(ii, &extensions.0[0], &extensions.1, &extensions.2[0], &extensions.3, &mut streamrecv).unwrap());
-		}
-
-		let childresult: Vec<SecpOrd> = child.join().unwrap();
-		for ii in 0..10 {
-			assert_eq!(results[ii].add(&childresult[ii]), beta[0].mul(&alpha[ii]));
-		}
-	}
-
-	#[bench]
-	fn bench_ote_mul_extend_net(b: &mut Bencher) -> () {
-		let child = thread::spawn(move || {
-			let mut rng = rand::thread_rng();
-			let listener = TcpListener::bind("127.0.0.1:4571").unwrap_or_else(|e| { panic!(e) });
-
-			let mut streamrecv = match listener.accept() {
-				Ok((stream, _)) => {
-					stream
-				},
-				Err(e) => panic!("couldn't get client: {:?}", e),
-			};
-
-			let mut streamsend = streamrecv.try_clone().unwrap();
-			let sender = OTESender::new(&mut rng, &mut streamrecv, &mut streamsend).unwrap();
-			let mut keepgoing = [1u8; 1];
-			streamrecv.read_exact(&mut keepgoing).unwrap();
-			let mut ii:usize = 0;
-			while keepgoing[0] > 0 {
-				sender.mul_extend(ii, 2, &mut streamrecv).unwrap();
-				streamrecv.read_exact(&mut keepgoing).unwrap();
-				ii+=1;
-			}
-		});
-
-		thread::sleep(time::Duration::from_millis(50));
-
-		let mut rng = rand::thread_rng();
-		let mut streamrecv = TcpStream::connect("127.0.0.1:4571").unwrap();
-		let mut streamsend = streamrecv.try_clone().unwrap();
-
-		let recver = OTERecver::new(&mut rng, &mut streamrecv, &mut streamsend).unwrap();
-		let mut beta:Vec<SecpOrd> = Vec::with_capacity(2);
-		for _ in 0..2 {
-			beta.push(SecpOrd::rand(&mut rng));
-		}
-
-		let mut ii:usize = 0;
-		b.iter(|| { 
-			streamsend.write(&[1]).unwrap();
-			streamsend.flush().unwrap();
-			recver.mul_encode_and_extend(ii, &beta, &mut rng, &mut streamsend).unwrap();
-			ii+=1;
-		});
-
-		streamsend.write(&[0]).unwrap();
-		streamsend.flush().unwrap();
-		child.join().unwrap();
-	}
-
-	#[bench]
-	fn bench_ote_mul_2_and_2(b: &mut Bencher) -> () {
-		let child = thread::spawn(move || {
-			let mut rng = rand::thread_rng();
-			let listener = TcpListener::bind("127.0.0.1:4573").unwrap_or_else(|e| { panic!(e) });
-
-			let mut streamrecv = match listener.accept() {
-				Ok((stream, _)) => {
-					stream
-				},
-				Err(e) => panic!("couldn't get client: {:?}", e),
-			};
-
-			let mut streamsend = streamrecv.try_clone().unwrap();
-			let sender = OTESender::new(&mut rng, &mut streamrecv, &mut streamsend).unwrap();
-			let mut keepgoing = [1u8; 1];
-
-			let mut alpha:Vec<SecpOrd> = Vec::with_capacity(2);
-			for _ in 0..2 {
-				alpha.push(SecpOrd::rand(&mut rng));
-			}
-
-			streamrecv.read_exact(&mut keepgoing).unwrap();
-			let mut ii:usize = 0;
-			while keepgoing[0] > 0 {
-				let extensions = sender.mul_extend(ii, 2, &mut streamrecv).unwrap();
-				sender.mul_transfer(ii*3+0, &alpha[0], &extensions.0[0], &extensions.1, &mut rng, &mut streamsend).unwrap();
-				sender.mul_transfer(ii*3+1, &alpha[1], &extensions.0[0], &extensions.1, &mut rng, &mut streamsend).unwrap();
-				streamsend.flush().unwrap();
-				streamrecv.read_exact(&mut keepgoing).unwrap();
-				ii += 1;
-			}
-		});
-
-		thread::sleep(time::Duration::from_millis(50));
-
-		let mut rng = rand::thread_rng();
-		let mut streamrecv = TcpStream::connect("127.0.0.1:4573").unwrap();
-		let mut streamsend = streamrecv.try_clone().unwrap();
-
-		let recver = OTERecver::new(&mut rng, &mut streamrecv, &mut streamsend).unwrap();
-		let mut beta:Vec<SecpOrd> = Vec::with_capacity(2);
-		for _ in 0..2 {
-			beta.push(SecpOrd::rand(&mut rng));
-		}
-
-		let mut ii:usize = 0;
-		b.iter(|| { 
-			streamsend.write(&[1]).unwrap();
-			streamsend.flush().unwrap();
-			let extensions = recver.mul_encode_and_extend(ii, &beta, &mut rng, &mut streamsend).unwrap();
-			recver.mul_transfer(ii*3+0, &extensions.0[0], &extensions.1, &extensions.2[0], &extensions.3, &mut streamrecv).unwrap();
-			recver.mul_transfer(ii*3+1, &extensions.0[0], &extensions.1, &extensions.2[0], &extensions.3, &mut streamrecv).unwrap();
-			ii += 1;
-		});
-
-		streamsend.write(&[0]).unwrap();
-		streamsend.flush().unwrap();
-		child.join().unwrap();
-	}
-
-	#[bench]
-	fn bench_ote_mul_2_and_3(b: &mut Bencher) -> () {
-		let child = thread::spawn(move || {
-			let mut rng = rand::thread_rng();
-			let listener = TcpListener::bind("127.0.0.1:4583").unwrap_or_else(|e| { panic!(e) });
-
-			let mut streamrecv = match listener.accept() {
-				Ok((stream, _)) => {
-					stream
-				},
-				Err(e) => panic!("couldn't get client: {:?}", e),
-			};
-
-			let mut streamsend = streamrecv.try_clone().unwrap();
-			let sender = OTESender::new(&mut rng, &mut streamrecv, &mut streamsend).unwrap();
-			let mut keepgoing = [1u8; 1];
-
-			let mut alpha:Vec<SecpOrd> = Vec::with_capacity(3);
-			for _ in 0..3 {
-				alpha.push(SecpOrd::rand(&mut rng));
-			}
-
-			streamrecv.read_exact(&mut keepgoing).unwrap();
-			let mut ii:usize = 0;
-			while keepgoing[0] > 0 {
-				let extensions = sender.mul_extend(ii, 2, &mut streamrecv).unwrap();
-				sender.mul_transfer(ii*3+0, &alpha[0], &extensions.0[0], &extensions.1, &mut rng, &mut streamsend).unwrap();
-				sender.mul_transfer(ii*3+1, &alpha[1], &extensions.0[0], &extensions.1, &mut rng, &mut streamsend).unwrap();
-				sender.mul_transfer(ii*3+2, &alpha[2], &extensions.0[1], &extensions.1, &mut rng, &mut streamsend).unwrap();
-				streamsend.flush().unwrap();
-				streamrecv.read_exact(&mut keepgoing).unwrap();
-				ii += 1;
-			}
-		});
-
-		thread::sleep(time::Duration::from_millis(50));
-
-		let mut rng = rand::thread_rng();
-		let mut streamrecv = TcpStream::connect("127.0.0.1:4583").unwrap();
-		let mut streamsend = streamrecv.try_clone().unwrap();
-
-		let recver = OTERecver::new(&mut rng, &mut streamrecv, &mut streamsend).unwrap();
-		let mut beta:Vec<SecpOrd> = Vec::with_capacity(2);
-		for _ in 0..2 {
-			beta.push(SecpOrd::rand(&mut rng));
-		}
-
-		let mut ii:usize = 0;
-		b.iter(|| { 
-			streamsend.write(&[1]).unwrap();
-			streamsend.flush().unwrap();
-			let extensions = recver.mul_encode_and_extend(ii, &beta, &mut rng, &mut streamsend).unwrap();
-			recver.mul_transfer(ii*3+0, &extensions.0[0], &extensions.1, &extensions.2[0], &extensions.3, &mut streamrecv).unwrap();
-			recver.mul_transfer(ii*3+1, &extensions.0[0], &extensions.1, &extensions.2[0], &extensions.3, &mut streamrecv).unwrap();
-			recver.mul_transfer(ii*3+2, &extensions.0[1], &extensions.1, &extensions.2[1], &extensions.3, &mut streamrecv).unwrap();
-			ii += 1;
-		});
-
-		streamsend.write(&[0]).unwrap();
-		streamsend.flush().unwrap();
-		child.join().unwrap();
-	}
 }

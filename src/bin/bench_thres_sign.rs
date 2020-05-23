@@ -1,5 +1,8 @@
 /// Benchmarking for 2 of n signing
-///
+
+use std::time::Duration;
+use std::thread::sleep;
+use std::io::{Write, Read};
 
 use std::net::{TcpListener, TcpStream};
 use std::{env};
@@ -9,10 +12,6 @@ use rand::{Rng};
 
 extern crate time;
 use time::PreciseTime;
-
-extern crate curves;
-use curves::{Ford};
-use curves::f_4141::FSecp256Ord;
 
 extern crate mpecdsa;
 
@@ -27,12 +26,16 @@ pub fn process_options() -> Option<Matches> {
 
     let mut opts = Options::new();
     opts.optopt("o", "", "set output file name", "NAME");
-    opts.optopt("p", "port", "set port", "PORT");
+    opts.optopt("p", "port", "lowest port (the required number will be allocated above)", "PORT");
     opts.optopt("n", "iterations", "number of iterations", "ITERS");
-    opts.optopt("c", "client", "set ip address of server", "IP");
+    opts.optopt("a", "addresses", "comma-delimited list of IP Addresses", "IP");
 
     opts.optflag("h", "help", "print this help menu");
-    opts.optflag("b", "bob", "run as bob");
+
+    // threshold flags
+    //opts.optopt("T", "threshold", "size of threshold", "THRES");
+    opts.optopt("N", "size", "number of parties", "SIZE");
+    opts.optopt("P", "party", "party number", "PARTY");
 
     let matches = match opts.parse(&args[1..]) {
         Ok(m) => { m }
@@ -52,7 +55,6 @@ pub fn process_options() -> Option<Matches> {
 
 
 fn main() {
-    let msg = "this is a test".as_bytes();
 
     let matches = process_options();
     if let None = matches {
@@ -60,60 +62,118 @@ fn main() {
     }
     let matches = matches.unwrap();
 
-    // start up connections like how 2P works
-    let (mut streamrecv, mut streamsend) = if matches.opt_present("c") {
-            let port = format!("{}:{}",
-                    matches.opt_str("c").unwrap(),
-                    matches.opt_str("p").unwrap_or("12345".to_owned())
-                    );
+    // number of parties
+    let parties = matches.opt_str("N").unwrap_or("2".to_owned()).parse::<usize>().unwrap();
+    //let thres = matches.opt_str("T").unwrap_or("2".to_owned()).parse::<usize>().unwrap();
+    // If party index isn't specified, assume 2P
+    let index = matches.opt_str("P").unwrap().parse::<usize>().unwrap();
+    let mut sendvec:Vec<Option<std::net::TcpStream>> = Vec::with_capacity(parties);
+    let mut recvvec: Vec<Option<std::net::TcpStream>> = Vec::with_capacity(parties);
 
-            println!("Connecting to server {:?}...", port);
-            let mut stream1 = TcpStream::connect(port).unwrap();
-            let stream2 = stream1.try_clone().unwrap();
-            (stream1, stream2)
+    if !matches.opt_present("p") && parties!=2 {
+        println!("Please add ports");
+        ::std::process::exit(1);
+    }
+    
+    // ports should be separated by commas
+    let addrs = matches.opt_str("a").unwrap_or("0.0.0.0".to_owned());
+    let addrs: Vec<&str> = addrs.split(",").collect();
+    let port: usize = matches.opt_str("p").unwrap_or("12345".to_owned()).parse().unwrap();
+    let min_ports = parties;
+    let mut ports = Vec::with_capacity(min_ports);
+    for ii in port..(port+min_ports) {
+        ports.push(format!("{}", ii));
+    }
+
+    for jj in 0..parties {
+        // first n-1 are party 0's ports, next n-2 party 1, ...
+        // given a high and a low, offset into list of ports is
+        //      sum i =1...low (n-i) => n*low - low*(low+1)/2
+        // corresponding port for high is given as the difference between high and low -1
+        //      high - low - 1
+        // port_index for pair high, low becomes
+        //      (n * low) - low * (low + 1) / 2 + high - low - 1
+
+        if jj < index {
+            let port_index = jj;
+            let port = format!("0.0.0.0:{}", &ports[port_index]);
+            println!("{} waiting for {} to connect on {}", index, jj, port);
+            let listener = TcpListener::bind(port).unwrap_or_else(|e| { panic!(e) });
+            let (recv, _) = listener.accept().unwrap_or_else(|e| {panic!(e)} );
+            let send = recv.try_clone().unwrap();
+            recv.set_nodelay(true).expect("Could not set nodelay");
+            send.set_nodelay(true).expect("Could not set nodelay");
+            sendvec.push(Some(send));
+            recvvec.push(Some(recv));
+        } else if jj > index {
+            let port_index = index;
+            let port = format!("{}:{}", addrs[jj], &ports[port_index]);
+            println!("{} connecting to {} server {:?}...", index, jj, port);
+            let mut send = TcpStream::connect(&port);
+            let connection_wait_time = 2*60;
+            let poll_interval = 100;
+            for _ in 0..(connection_wait_time*1000/poll_interval) {
+                if send.is_err() {
+                    sleep(Duration::from_millis(poll_interval));
+                    send = TcpStream::connect(&port);    
+                }
+            }
+            let send = send.unwrap();
+            let recv = send.try_clone().unwrap();
+            recv.set_nodelay(true).expect("Could not set nodelay");
+            send.set_nodelay(true).expect("Could not set nodelay");
+            sendvec.push(Some(send));
+            recvvec.push(Some(recv));
         } else {
-            let port = format!("0.0.0.0:{}", matches.opt_str("p").unwrap_or("12345".to_owned()));
-            println!("Waiting for client to connect on {}", port);
-            let listener = TcpListener::bind(port).unwrap_or_else(|e| {panic!(e)} );
-            let (mut stream1, _) = listener.accept().unwrap_or_else(|e| {panic!(e)} );
-            let stream2 = stream1.try_clone().unwrap();
-            (stream2, stream1)
-        };
-
-    streamsend.set_nodelay(true).expect("Could not set nodelay");
-    streamrecv.set_nodelay(true).expect("Could not set nodelay");
-
+            // pause here so the lower numbers can start their listeners?
+            //sleep(Duration::from_millis(500));
+            sendvec.push(None);
+            recvvec.push(None);
+        }
+    }
+    
     let iters = matches.opt_str("n").unwrap_or("1000".to_owned()).parse::<i32>().unwrap();
     let mut seeder = rand::os::OsRng::new().unwrap();
     let mut rng = rand::ChaChaRng::new_unseeded();
     rng.set_counter(seeder.gen::<u64>(), seeder.gen::<u64>());
 
-    println!("Connected. Performing {} Iteration Benchmark...", iters);
-
-    if matches.opt_present("b") {
-        let skb = FSecp256Ord::from_slice(&[0xb75db4463a602ff0, 0x83b6a76e7fad1ec, 0xa33f33b8e9c84dbd, 0xb94fceb9fff7cfb2]);
-        
-            let bob = mpecdsa::mpecdsa::ThresholdSigner::new(1, 2, &skb, &mut rng, &mut [Some(&mut streamrecv), None], &mut [Some(&mut streamsend), None]).unwrap();
-
-            let signstart = PreciseTime::now();
-            for _ in 0..iters {
-                bob.sign(&[0], &msg, &mut rng, &mut streamrecv, &mut streamsend).unwrap();
-            }
-            let signend = PreciseTime::now();
-            println!("{} ms avg", (signstart.to(signend)/iters)*1000);
-        
-    } else {
-        let ska = FSecp256Ord::from_slice(&[0xc93d9fa738a8b4b6, 0xe8dd5f4af65e7462, 0xcbdf97aeca50c5c4, 0x67498f7dcab40d3]);
-        
-        let alice = mpecdsa::mpecdsa::ThresholdSigner::new(0, 2, &ska, &mut rng, &mut [None, Some(&mut streamrecv)], &mut [None, Some(&mut streamsend)]).unwrap();
-
-        let signstart = PreciseTime::now();
-        for _ in 0..iters {
-            alice.sign(&[1], &msg, &mut rng, &mut streamrecv, &mut streamsend).unwrap();
+    if index==parties-1 {
+        for ii in 0..parties-1 {
+            sendvec[ii].as_mut().unwrap().write(&[0]).expect(&format!("Party {} failed to send ready signal.", index));
+            sendvec[ii].as_mut().unwrap().flush().expect(&format!("Party {} failed to flush.", index));
         }
-        let signend = PreciseTime::now();
-        println!("{} ms avg", (signstart.to(signend)/iters)*1000);
-    
+    } else {
+        let mut sigread = [1u8; 1];
+        recvvec[parties-1].as_mut().unwrap().read_exact(&mut sigread).expect(&format!("Party {} failed to read ready signal.", index));
     }
-    
+
+    println!("{} connected. Initializing...", index);
+
+    let mut signer = mpecdsa::mpecdsa::ThresholdSigner::new(index, parties, &mut rng, sendvec.as_mut_slice(), recvvec.as_mut_slice()).unwrap();
+
+    if index==parties-1 {
+        let mut sigread = [1u8; 1];
+        for ii in 0..parties-1 {
+            recvvec[ii].as_mut().unwrap().read_exact(&mut sigread).expect(&format!("Party {} failed to send ready signal.", ii));
+        }
+        for ii in 0..parties-1 {
+            sendvec[ii].as_mut().unwrap().write(&[0]).expect(&format!("Party {} failed to send ready signal.", index));
+            sendvec[ii].as_mut().unwrap().flush().expect(&format!("Party {} failed to flush.", index));
+        }
+    } else {
+        let mut sigread = [1u8; 1];
+        sendvec[parties-1].as_mut().unwrap().write(&[0]).expect(&format!("Party {} failed to send ready signal.", index));
+        sendvec[parties-1].as_mut().unwrap().flush().expect(&format!("Party {} failed to flush.", index));
+        recvvec[parties-1].as_mut().unwrap().read_exact(&mut sigread).expect(&format!("Party {} failed to send ready signal.", parties-1));
+    }
+
+    println!("Performing {} Iteration Benchmark...", iters);
+
+    let setupstart = PreciseTime::now();
+    for _ in 0..iters {
+        signer.sign(&(0usize..index).chain((index+1)..(parties)).collect::<Vec<usize>>(), &"etaoin shrdlu".as_bytes(), &mut rng, &mut recvvec, &mut sendvec).unwrap();
+    }
+    let setupend = PreciseTime::now();
+    println!("{:.3} ms avg", (setupstart.to(setupend).num_milliseconds() as f64)/(iters as f64));
+
 }

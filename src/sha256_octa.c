@@ -1,5 +1,5 @@
 /// octa-instance sha-256 evaluation on 1 block
-/// the hard-wired padding routines assume that the data is exactly 48 bytes
+/// the hard-wired padding routines assume that the data is exactly 52 bytes
 /// so that sha-256 only requires 1 iteration of the compression loop.
 ///
 /// aas 2017
@@ -346,7 +346,7 @@ void pp(__m256i p) {
 	}
 
 
-inline void sha256_octa_52b(const unsigned char* buf, unsigned char* out) {
+static inline void sha256_octa_52b(const unsigned char* buf, unsigned char* out) {
 
 	const __m256i *input = (const __m256i *)buf; 
 
@@ -664,7 +664,7 @@ inline void sha256_octa_52b(const unsigned char* buf, unsigned char* out) {
 
 void sha256_multi_52b(const unsigned char* buf, unsigned char* out, size_t count) {
 	size_t ii;
-	#pragma omp parallel for
+	//#pragma omp parallel for
 	for (ii = 0; ii < count/8; ii++) {
 		sha256_octa_52b(&buf[64*8*ii], &out[32*8*ii]);
 	}

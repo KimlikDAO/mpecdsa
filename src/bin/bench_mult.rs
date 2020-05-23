@@ -1,5 +1,4 @@
-/// Benchmarking for 2 of n setup
-/// (make this general enough for any reasonably sized n)
+/// Benchmarking for 2 of n signing
 
 use std::time::Duration;
 use std::thread::sleep;
@@ -8,6 +7,9 @@ use std::io::{Write, Read};
 use std::net::{TcpListener, TcpStream};
 use std::{env};
 
+extern crate rayon;
+use rayon::prelude::*;
+
 extern crate rand;
 use rand::{Rng};
 
@@ -15,6 +17,13 @@ extern crate time;
 use time::PreciseTime;
 
 extern crate mpecdsa;
+use mpecdsa::*;
+use mpecdsa::ro::*;
+use mpecdsa::mul::*;
+use mpecdsa::mpmul::*;
+
+extern crate curves;
+use curves::{Ford, SecpOrd};
 
 extern crate getopts;
 use self::getopts::{Options, Matches};
@@ -34,7 +43,7 @@ pub fn process_options() -> Option<Matches> {
     opts.optflag("h", "help", "print this help menu");
 
     // threshold flags
-    opts.optopt("T", "threshold", "size of threshold", "THRES");
+    //opts.optopt("T", "threshold", "size of threshold", "THRES");
     opts.optopt("N", "size", "number of parties", "SIZE");
     opts.optopt("P", "party", "party number", "PARTY");
 
@@ -65,7 +74,7 @@ fn main() {
 
     // number of parties
     let parties = matches.opt_str("N").unwrap_or("2".to_owned()).parse::<usize>().unwrap();
-    let thres = matches.opt_str("T").unwrap_or("2".to_owned()).parse::<usize>().unwrap();
+    //let thres = matches.opt_str("T").unwrap_or("2".to_owned()).parse::<usize>().unwrap();
     // If party index isn't specified, assume 2P
     let index = matches.opt_str("P").unwrap().parse::<usize>().unwrap();
     let mut sendvec:Vec<Option<std::net::TcpStream>> = Vec::with_capacity(parties);
@@ -80,11 +89,11 @@ fn main() {
     let addrs = matches.opt_str("a").unwrap_or("0.0.0.0".to_owned());
     let addrs: Vec<&str> = addrs.split(",").collect();
     let port: usize = matches.opt_str("p").unwrap_or("12345".to_owned()).parse().unwrap();
-    let min_ports = parties;
-    let mut ports = Vec::with_capacity(min_ports);
-    for ii in port..(port+min_ports) {
-        ports.push(format!("{}", ii));
-    }
+    //let min_ports = parties*(parties)/2;
+    //let mut ports = Vec::with_capacity(min_ports);
+    //for ii in port..(port+min_ports) {
+    //    ports.push(format!("{}", ii));
+    //}
 
     for jj in 0..parties {
         // first n-1 are party 0's ports, next n-2 party 1, ...
@@ -96,8 +105,9 @@ fn main() {
         //      (n * low) - low * (low + 1) / 2 + high - low - 1
 
         if jj < index {
-            let port_index = jj;
-            let port = format!("0.0.0.0:{}", &ports[port_index]);
+            //let port_index = (jj*parties)-(jj*(jj+1))/2 + (index-jj) - 1;
+            //let port = format!("0.0.0.0:{}", &ports[port_index]);
+            let port = format!("0.0.0.0:{}", &(port + jj));
             println!("{} waiting for {} to connect on {}", index, jj, port);
             let listener = TcpListener::bind(port).unwrap_or_else(|e| { panic!(e) });
             let (recv, _) = listener.accept().unwrap_or_else(|e| {panic!(e)} );
@@ -107,11 +117,12 @@ fn main() {
             sendvec.push(Some(send));
             recvvec.push(Some(recv));
         } else if jj > index {
-            let port_index = index;
-            let port = format!("{}:{}", addrs[jj], &ports[port_index]);
+            //let port_index = (index*parties)-(index*(index+1))/2 + (jj-index) - 1;
+            //let port = format!("{}:{}", addrs[jj], &ports[port_index]);
+            let port = format!("{}:{}", addrs[jj], &(port + index));
             println!("{} connecting to {} server {:?}...", index, jj, port);
             let mut send = TcpStream::connect(&port);
-            let connection_wait_time = 2*60;
+            let connection_wait_time = 10*60;
             let poll_interval = 100;
             for _ in 0..(connection_wait_time*1000/poll_interval) {
                 if send.is_err() {
@@ -138,7 +149,56 @@ fn main() {
     let mut rng = rand::ChaChaRng::new_unseeded();
     rng.set_counter(seeder.gen::<u64>(), seeder.gen::<u64>());
 
+    if index==parties-1 {
+        for ii in 0..parties-1 {
+            sendvec[ii].as_mut().unwrap().write(&[0]).expect(&format!("Party {} failed to send ready signal.", index));
+            sendvec[ii].as_mut().unwrap().flush().expect(&format!("Party {} failed to flush.", index));
+        }
+    } else {
+        let mut sigread = [1u8; 1];
+        recvvec[parties-1].as_mut().unwrap().read_exact(&mut sigread).expect(&format!("Party {} failed to read ready signal.", index));
+    }
+
     println!("{} connected. Initializing...", index);
+    
+    let mut ro = {
+        let mut prunedrecv : Vec<Option<&mut _>> = recvvec.iter_mut().map(|val| val.as_mut()).collect();
+        let mut prunedsend : Vec<Option<&mut _>> = sendvec.iter_mut().map(|val| val.as_mut()).collect();
+        GroupROTagger::from_network_unverified(index, &mut rng, &mut prunedrecv[..], &mut prunedsend[..]).unwrap()
+    };
+
+    let mut rngs = Vec::with_capacity(parties);
+    for _ in 0..parties {
+        let mut newrng = rand::ChaChaRng::new_unseeded();
+        newrng.set_counter(rng.next_u64(), rng.next_u64());
+        rngs.push(newrng);
+    }
+
+    let threadcount = match std::env::var_os("RAYON_NUM_THREADS") {
+        Some(val) => {
+            let val = val.into_string().unwrap().parse().unwrap();
+            if val > 0 {
+                val
+            } else {
+                parties
+            }
+        },
+        None => parties
+    };
+
+    let rayonpool = rayon::ThreadPoolBuilder::new().num_threads(threadcount).build().unwrap();
+    let multipliervec = rayonpool.install(|| { sendvec.par_iter_mut().zip(recvvec.par_iter_mut()).zip(rngs.par_iter_mut()).enumerate().map(|(ii, ((sendi, recvi), rngi))| {
+        if ii > index {
+            MulPlayer::Sender(mul::MulSender::new(&ro.get_dyadic_tagger(ii).unwrap(), rngi, recvi.as_mut().unwrap(), sendi.as_mut().unwrap()).unwrap())
+        } else if ii < index {
+            MulPlayer::Recver(mul::MulRecver::new(&ro.get_dyadic_tagger(ii).unwrap(), rngi, recvi.as_mut().unwrap(), sendi.as_mut().unwrap()).unwrap())
+        } else {
+            MulPlayer::Null
+        }
+    }).collect::<Vec<_>>() });
+
+    let counterparties = (0..parties).collect::<Vec<usize>>();
+    ro.apply_subgroup_list(&counterparties).unwrap();
 
     if index==parties-1 {
         let mut sigread = [1u8; 1];
@@ -158,9 +218,18 @@ fn main() {
 
     println!("Performing {} Iteration Benchmark...", iters);
 
+    let mut prunedrecv : Vec<&mut Option<_>> = recvvec.iter_mut().enumerate().filter_map(|(index, val)| if counterparties.contains(&index) {Some(val)} else {None}).collect();
+    let mut prunedsend : Vec<&mut Option<_>> = sendvec.iter_mut().enumerate().filter_map(|(index, val)| if counterparties.contains(&index) {Some(val)} else {None}).collect();
+    let mut prunedmultiplier : Vec<&mul::MulPlayer> = multipliervec.iter().enumerate().filter_map(|(index, val)| if counterparties.contains(&index) {Some(val)} else {None}).collect();
+
     let setupstart = PreciseTime::now();
     for _ in 0..iters {
-        mpecdsa::mpecdsa::ThresholdSigner::new(index, thres, &mut rng, sendvec.as_mut_slice(), recvvec.as_mut_slice()).unwrap();
+        let shares = mprmul(1, index, &mut prunedmultiplier[..], &mut ro, &mut rng, &mut prunedrecv[..], &mut prunedsend[..], &rayonpool).unwrap();
+        let mut shares1 = Vec::with_capacity(shares.len());
+        for kk in 0..shares.len() {
+            shares1.push(&shares[kk][..]);
+        }
+        mpmul(&[SecpOrd::rand(&mut rng)], index, &shares1.as_slice(), &mut prunedrecv.as_mut_slice(), &mut prunedsend.as_mut_slice()).unwrap();
     }
     let setupend = PreciseTime::now();
     println!("{:.3} ms avg", (setupstart.to(setupend).num_milliseconds() as f64)/(iters as f64));

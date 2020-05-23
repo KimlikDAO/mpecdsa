@@ -1,4 +1,8 @@
 [submodule "curves"]
 	path = curves
-	url = git@gitlab.com:neucrypt/curves.git
+	url = https://gitlab.com/neucrypt/curves.git
 	branch = release
+
+[submodule "blake2"]
+	path = blake2
+	url = https://github.com/BLAKE2/BLAKE2.git

@@ -1,7 +1,17 @@
+/***********
+ * This module implements the two-party ECDSA protocols
+ * described in the paper "Secure Two-party Threshold ECDSA from ECDSA Assumptions"
+ * by Doerner, Kondi, Lee, and shelat (https://eprint.iacr.org/2018/499)
+ * 
+ * It also implements the multi-party ECDSA protocols
+ * described in the paper "Threshold ECDSA from ECDSA Assumptions"
+ * by Doerner, Kondi, Lee, and shelat
+ ***********/
+
 use std::io::prelude::*;
-use std::io::{BufWriter};
-use std::sync::atomic::{AtomicUsize,Ordering};
-use std::env;
+use std::io::{BufWriter,Cursor};
+
+use byteorder::{ByteOrder, LittleEndian};
 
 use rand::{Rng};
 
@@ -10,81 +20,89 @@ use rayon::prelude::*;
 use curves::{ECGroup, Ford, Fq, Secp, SecpOrd, ecdsa, precomp};
 
 use super::mpecdsa_error::*;
+use super::ro::*;
 use super::zkpok::*;
-use super::ote::*;
+use super::mul::*;
+use super::mpmul::*;
 use super::*;
 
 //#[derive(Clone)]
 pub struct Alice2P {
-	ote: ote::OTESender,
+	ro: GroupROTagger,
+	multiplier: mul::MulSender,
 	ska: SecpOrd,
+	#[allow(dead_code)]
 	pk: Secp,
-	pktable: Vec<Secp>,
-	sigid: AtomicUsize,
+	pktable: Vec<Secp>
 }
 
 //#[derive(Clone)]
 pub struct Bob2P {
-	ote: ote::OTERecver,
+	ro: GroupROTagger,
+	multiplier: mul::MulRecver,
 	skb: SecpOrd,
+	#[allow(dead_code)]
 	pk: Secp,
-	pktable: Vec<Secp>,
-	sigid: AtomicUsize,
+	pktable: Vec<Secp>
 }
 
 pub struct ThresholdSigner {
 	playerindex: usize,
 	threshold: usize,
-	ote: Vec<ote::OTEPlayer>,
+	ro: GroupROTagger,
+	multiplier: Vec<mul::MulPlayer>,
 	poly_point: SecpOrd,
+	#[allow(dead_code)]
 	pk: Secp,
-	pktable: Vec<Secp>,
-	sigids: Vec<AtomicUsize>,
+	pktable: Vec<Secp>
 }
 
 impl Alice2P {
-	pub fn new<TR:Read, TW:Write>(ska:&SecpOrd, rng:&mut Rng, recv:&mut TR, send:&mut TW) -> Result<Alice2P, MPECDSAError> {
+	pub fn new<TR:Read, TW:Write>(ska:&SecpOrd, rng:&mut dyn Rng, recv:&mut TR, send:&mut TW) -> Result<Alice2P, MPECDSAError> {
+		let ro = GroupROTagger::from_network_unverified(0, rng, &mut [None, Some(recv)], &mut [None, Some(send)])?;
 		
 		// commit to PoK-DL for pk_a
 		let pka = Secp::scalar_table_multi(&precomp::P256_TABLE[..], &ska).affine();
-		let (proofcommitment, proof) = prove_dl_fs_to_com(ska, &pka, rng);
-		try!(send.write(&proofcommitment));
-		try!(send.flush());
+		let (proofcommitment, proof) = prove_dl_fs_to_com(ska, &pka, &ModelessGroupROTagger::new(&ro, false), rng)?;
+		send.write(&proofcommitment)?;
+		send.flush()?;
 
 		// recv pk_b
 		let mut buf = [0u8; Secp::NBYTES];
-		try!(recv.read_exact(&mut buf));
+		recv.read_exact(&mut buf)?;
 		let pkb: Secp = Secp::from_bytes(&buf);
 
 		// verify PoK-DL for pk_b
-		match verify_dl_fs(&pkb, recv) {
+		match verify_dl_fs(&pkb, &ModelessDyadicROTagger::new(&ro.get_dyadic_tagger(1).unwrap(), false), recv) {
 			Ok(f) => { if !f { return Err(MPECDSAError::Proof(ProofError::new("Proof of Knowledge failed for ECDSA secret key (bob cheated)"))); } },
-			Err(e) => return Err(MPECDSAError::Io(e)),
+			Err(e) => return Err(e),
 		};
 
 		// send pk_a
 		// open commitment to PoK-DL
 		pka.to_bytes(&mut buf);
-		try!(send.write(&buf));
-		try!(send.write(&proof));
-		try!(send.flush());
+		send.write(&buf)?;
+		send.write(&proof)?;
+		send.flush()?;
+
+		// initialize multiplication
+		let mul = mul::MulSender::new(&ro.get_dyadic_tagger(1).unwrap(), rng, recv, send)?;
 			
 		// calc pk, setup OT exts
 		let pk = pkb.scalar_table(&ska).affine();
 		let pktable = Secp::precomp_table(&pk);
 		let res = Alice2P {
-			ote: try!(ote::OTESender::new(rng, recv, send)),
+			ro: ro,
+			multiplier: mul,
 			ska: ska.clone(),
 			pk: pk,
-			pktable: pktable,
-			sigid: AtomicUsize::new(0)
+			pktable: pktable
 		};
 
 		Ok(res)
 	}
 
-	pub fn sign<TR:Read, TW:Write+std::marker::Send>(&self, msg:&[u8], rng:&mut Rng, recv:&mut TR, send:&mut TW) -> Result<(),MPECDSAError> {
-		let sigid = self.sigid.fetch_add(1, Ordering::Relaxed);
+	pub fn sign<TR:Read, TW:Write+Send>(&self, msg:&[u8], rng:&mut dyn Rng, recv:&mut TR, send:&mut TW) -> Result<(),MPECDSAError> {
 		let mut bufsend = BufWriter::new(send);
 
 		// precompute things you won't need till later
@@ -97,20 +115,22 @@ impl Alice2P {
 
 		// hash the message
 		let mut z = [0; HASH_SIZE];
-		hash(&mut z, msg);
+		ecdsa_hash(&mut z, msg);
 		let z = SecpOrd::from_bytes(&z);
 
 		// online phase
+		let dro = self.ro.get_dyadic_tagger(1).unwrap();
 
 		// recv D_b from bob
 		let mut dbraw = [0u8; Secp::NBYTES];
-		try!(recv.read_exact(&mut dbraw));
+		recv.read_exact(&mut dbraw)?;
 		let db = Secp::from_bytes(&dbraw);
 		let dbtable = Secp::precomp_table(&db);
 
 		let rprime = Secp::scalar_table_multi(&dbtable[..],&kaprime).affine();
-		let mut rprimeraw = [0u8;Secp::NBYTES];
-		rprime.to_bytes(&mut rprimeraw);
+		let mut rprimeraw = [0u8;Secp::NBYTES + RO_TAG_SIZE];
+		rprime.to_bytes(&mut rprimeraw[RO_TAG_SIZE..]);
+		rprimeraw[0..RO_TAG_SIZE].copy_from_slice(&dro.next_dyadic_tag());
 		let mut kaoffsetraw = [0u8;HASH_SIZE];
 		hash(&mut kaoffsetraw, &rprimeraw);
 		let kaoffset = SecpOrd::from_bytes(&kaoffsetraw);
@@ -130,37 +150,39 @@ impl Alice2P {
 
 		// Prove knowledge of ka for R; hardcoded fiat-shamir so we can do preprocessing
 		let kaproof_randcommitted = SecpOrd::rand(rng);
-		let mut kaproof_buf = [0u8;2*Secp::NBYTES + SecpOrd::NBYTES];
+		let mut kaproof_buf = [0u8;2*Secp::NBYTES + SecpOrd::NBYTES + RO_TAG_SIZE];
 		let kaproof_randcommitment = Secp::scalar_table_multi(&dbtable[..], &kaproof_randcommitted);
-		kaproof_randcommitment.to_bytes(&mut kaproof_buf[Secp::NBYTES..2*Secp::NBYTES]);
-		r.to_bytes(&mut kaproof_buf[0..Secp::NBYTES]);
+		kaproof_randcommitment.to_bytes(&mut kaproof_buf[(RO_TAG_SIZE + Secp::NBYTES)..(2*Secp::NBYTES + RO_TAG_SIZE)]);
+		r.to_bytes(&mut kaproof_buf[RO_TAG_SIZE..(Secp::NBYTES + RO_TAG_SIZE)]);
+		kaproof_buf[0..RO_TAG_SIZE].copy_from_slice(&dro.next_dyadic_tag());
 		let mut kaproof_challenge = [0u8; HASH_SIZE];
-		hash(&mut kaproof_challenge, &kaproof_buf[0..2*Secp::NBYTES]);
+		hash(&mut kaproof_challenge, &kaproof_buf[0..(2*Secp::NBYTES + RO_TAG_SIZE)]);
 		let kaproof_challenge = SecpOrd::from_bytes(&kaproof_challenge[..]);
 		let kaproof_z = ka.mul(&kaproof_challenge).add(&kaproof_randcommitted);
-		kaproof_z.to_bytes(&mut kaproof_buf[2*Secp::NBYTES..]);
+		kaproof_z.to_bytes(&mut kaproof_buf[(2*Secp::NBYTES + RO_TAG_SIZE)..]);
 
 		// generate OT extensions for two multiplications (input independent for alice)
-		let extensions = try!(self.ote.mul_extend(sigid, 2, recv));
+		let extensions = self.multiplier.mul_extend(2, &dro, recv)?;
 
 		// end first message (bob to alice)
 
 		// alice sends D'_a = k'_a*G rather than D_a so that bob can check her work
 		// she also sends her proof of knowledge for k_a
-		try!(bufsend.write(&rprimeraw));
-		try!(bufsend.write(&kaproof_buf[Secp::NBYTES..]));
-		try!(bufsend.flush());
+		bufsend.write(&rprimeraw[RO_TAG_SIZE..])?;
+		bufsend.write(&kaproof_buf[(Secp::NBYTES + RO_TAG_SIZE)..])?;
+		bufsend.flush()?;
 
 		// perform two multiplications with 1/k_a and sk_a/k_a.
-		let t1a = try!(self.ote.mul_transfer(sigid*2+0, &kai.add(&kapad), &extensions.0[0], &extensions.1, rng, &mut bufsend));
-		try!(bufsend.flush());
-		let t2a = try!(self.ote.mul_transfer(sigid*2+1, &skai, &extensions.0[1], &extensions.1, rng, &mut bufsend));
-		try!(bufsend.flush());
+		let t1a = self.multiplier.mul_transfer(&[&kai.add(&kapad)], &[&extensions.0[0]], &extensions.1, &dro, rng, &mut bufsend)?[0];
+		bufsend.flush()?;
+		let mut gamma1raw = [0u8;Secp::NBYTES+RO_TAG_SIZE];
+		gamma1raw[0..RO_TAG_SIZE].copy_from_slice(&dro.next_dyadic_tag());
+		let t2a = self.multiplier.mul_transfer(&[&skai], &[&extensions.0[1]], &extensions.1, &dro, rng, &mut bufsend)?[0];
+		bufsend.flush()?;
 
 		// compute check value Gamma_1 for alice
-		let gamma1 = Secp::op( &Secp::op( &Secp::scalar_table_multi(&r_table[..], &t1a.neg()), &kapadda ), &Secp::gen()).affine();
-		let mut gamma1raw = [0u8;Secp::NBYTES];
-		gamma1.to_bytes(&mut gamma1raw);
+		let gamma1 = Secp::op( &Secp::op( &Secp::scalar_table_multi(&r_table[..], &t1a.neg()), &kapadda ), &Secp::gen()).affine();		
+		gamma1.to_bytes(&mut gamma1raw[RO_TAG_SIZE..]);
 		let mut enckey = [0u8;HASH_SIZE];
 		hash(&mut enckey, &gamma1raw);
 		let mut kapadraw = [0u8;SecpOrd::NBYTES];
@@ -168,8 +190,8 @@ impl Alice2P {
 		for ii in 0..SecpOrd::NBYTES {
 			kapadraw[ii] ^= enckey[ii];
 		}
-		try!(bufsend.write(&kapadraw));
-		try!(bufsend.flush());
+		bufsend.write(&kapadraw)?;
+		bufsend.flush()?;
 
 		// compute signature share m_a for alice
 		let mut ma = [0u8;SecpOrd::NBYTES];
@@ -180,16 +202,17 @@ impl Alice2P {
 		let t2ag = Secp::scalar_table_multi(&precomp::P256_TABLE[..], &t2a.neg());
 		let t1apk = Secp::scalar_table_multi(&self.pktable[..], &t1a);
 		let gamma2 = Secp::op(&t2ag, &t1apk).affine();
-		let mut gamma2raw = [0u8;Secp::NBYTES];
-		gamma2.to_bytes(&mut gamma2raw);
+		let mut gamma2raw = [0u8;Secp::NBYTES+RO_TAG_SIZE];
+		gamma2.to_bytes(&mut gamma2raw[RO_TAG_SIZE..]);
+		gamma2raw[0..RO_TAG_SIZE].copy_from_slice(&dro.next_dyadic_tag());
 		hash(&mut enckey, &gamma2raw);
 		for ii in 0..SecpOrd::NBYTES {
 			ma[ii] ^= enckey[ii];
 		}
 
 		// send encrypted signature share
-		try!(bufsend.write(&ma));
-		try!(bufsend.flush());
+		bufsend.write(&ma)?;
+		bufsend.flush()?;
 
 		// end second message (alice to bob)
 
@@ -198,47 +221,53 @@ impl Alice2P {
 }
 
 impl Bob2P {
-	pub fn new<TR:Read, TW:Write>(skb:&SecpOrd, rng:&mut Rng, recv:&mut TR, send:&mut TW) -> Result<Bob2P, MPECDSAError> {
+	pub fn new<TR:Read, TW:Write>(skb:&SecpOrd, rng:&mut dyn Rng, recv:&mut TR, send:&mut TW) -> Result<Bob2P, MPECDSAError> {
+		let ro = GroupROTagger::from_network_unverified(1, rng, &mut [Some(recv), None], &mut [Some(send), None])?;
+
 		// recv PoK commitment
 		let mut proofcommitment = [0u8; 32];
-		try!(recv.read_exact( &mut proofcommitment ));
+		recv.read_exact( &mut proofcommitment )?;
 
 		// send pk_b
 		let pkb = Secp::scalar_table_multi(&precomp::P256_TABLE[..], &skb).affine();
 		let mut buf = [0u8; Secp::NBYTES];
 		pkb.to_bytes(&mut buf);
-		try!(send.write(&buf));
-		try!(send.flush());
+		send.write(&buf)?;
+		send.flush()?;
 		
 		// prove dl for pk_b
-		try!(prove_dl_fs(&skb, &pkb, rng, send));
+		prove_dl_fs(&skb, &pkb, &ModelessGroupROTagger::new(&ro,false), rng, send)?;
 
 		// recv pk_a
-		try!(recv.read_exact(&mut buf));
+		recv.read_exact(&mut buf)?;
 		let pka: Secp = Secp::from_bytes(&buf);
 
+		let proofresult = verify_dl_fs_with_com(&pka, &proofcommitment, &ModelessDyadicROTagger::new(&ro.get_dyadic_tagger(0).unwrap(),false), recv);
+
+		// initialize multiplication
+		let mul = mul::MulRecver::new(&ro.get_dyadic_tagger(0).unwrap(), rng, recv, send)?;
+
 		// verify PoK to which alice previously committed, then calc pk, setup OT exts
-		match verify_dl_fs_with_com(&pka, &proofcommitment, recv) {
+		match proofresult {
 			Ok(true) => {
 				let pk = pka.scalar_table(&skb).affine();
 				let pktable = Secp::precomp_table(&pk);
 				let res = Bob2P {
-					ote: try!(OTERecver::new(rng, recv, send)),
+					ro: ro,
+					multiplier: mul,
 					skb: skb.clone(),
 					pk: pk,
-					pktable: pktable,
-					sigid: AtomicUsize::new(0)
+					pktable: pktable
 				};
 
 				Ok(res)            
 			},
 			Ok(false) => Err(MPECDSAError::Proof(ProofError::new("Proof of Knowledge failed for ECDSA secret key (alice cheated)"))),
-			Err(e) =>  Err(MPECDSAError::Io(e)) 
+			Err(e) =>  Err(e) 
 		}
 	}
 
-	pub fn sign<TR: Read, TW: Write>(&self, msg:&[u8], rng:&mut Rng, recv: &mut TR, send: &mut TW) -> Result<(SecpOrd, SecpOrd),MPECDSAError> {
-		let sigid = self.sigid.fetch_add(1, Ordering::Relaxed);
+	pub fn sign<TR: Read, TW: Write>(&self, msg:&[u8], rng:&mut dyn Rng, recv: &mut TR, send: &mut TW) -> Result<(SecpOrd, SecpOrd),MPECDSAError> {
 		let mut bufsend = BufWriter::new(send);
 
 		// no precomputation - we want to begin writing as soon as possible
@@ -248,22 +277,27 @@ impl Bob2P {
 		let db = Secp::scalar_table_multi(&precomp::P256_TABLE[..], &kb);
 		let mut dbraw = [0u8; Secp::NBYTES];
 		db.to_bytes(&mut dbraw);
-		try!(bufsend.write(&dbraw));
-		try!(bufsend.flush());
+		bufsend.write(&dbraw)?;
+		bufsend.flush()?;
+
+		let dro = self.ro.get_dyadic_tagger(0).unwrap();
+		let rprime_tag = dro.next_dyadic_tag();
+		let kaproof_tag = dro.next_dyadic_tag();
 
 		// generate OT extensions for multiplications with 1/k_b and sk_b/k_b
 		let kbi  = kb.inv();
 		let skbi = kbi.mul(&self.skb);
 		let betas = [kbi.clone(), skbi.clone()];
-		let extensions = try!(self.ote.mul_encode_and_extend(sigid, &betas, rng, &mut bufsend));
-		try!(bufsend.flush());
+		let extensions = self.multiplier.mul_encode_and_extend( &betas, &dro, rng, &mut bufsend)?;
+		bufsend.flush()?;
 
 		// end first message (bob to alice)
 
 		// receive D'_a from alice, calculate D_a as D_a = H(D'_a)*G + D'_a
-		let mut rprimeraw = [0u8;Secp::NBYTES];
-		try!(recv.read_exact(&mut rprimeraw));
-		let rprime = Secp::from_bytes(&rprimeraw);
+		let mut rprimeraw = [0u8;Secp::NBYTES + RO_TAG_SIZE];
+		recv.read_exact(&mut rprimeraw[RO_TAG_SIZE..])?;
+		let rprime = Secp::from_bytes(&rprimeraw[RO_TAG_SIZE..]);
+		rprimeraw[0..RO_TAG_SIZE].copy_from_slice(&rprime_tag);
 		let mut kaoffsetraw = [0u8;HASH_SIZE];
 		hash(&mut kaoffsetraw, &rprimeraw);
 		let kaoffset = SecpOrd::from_bytes(&kaoffsetraw);
@@ -277,13 +311,14 @@ impl Bob2P {
 		let r_table = Secp::precomp_table(&r);
 
 		// verify alice's PoK of k_a for R
-		let mut kaproof_buf = [0u8;2*Secp::NBYTES + SecpOrd::NBYTES];
-		r.to_bytes(&mut kaproof_buf[0..Secp::NBYTES]);
-		try!(recv.read_exact(&mut kaproof_buf[Secp::NBYTES..]));
-		let kaproof_randcommitment = Secp::from_bytes(&kaproof_buf[Secp::NBYTES..2*Secp::NBYTES]);
-		let kaproof_z = SecpOrd::from_bytes(&kaproof_buf[2*Secp::NBYTES..]);
+		let mut kaproof_buf = [0u8;2*Secp::NBYTES + SecpOrd::NBYTES + RO_TAG_SIZE];
+		r.to_bytes(&mut kaproof_buf[RO_TAG_SIZE..(Secp::NBYTES + RO_TAG_SIZE)]);
+		recv.read_exact(&mut kaproof_buf[(RO_TAG_SIZE + Secp::NBYTES)..])?;
+		let kaproof_randcommitment = Secp::from_bytes(&kaproof_buf[(RO_TAG_SIZE + Secp::NBYTES)..(2*Secp::NBYTES + RO_TAG_SIZE)]);
+		let kaproof_z = SecpOrd::from_bytes(&kaproof_buf[(RO_TAG_SIZE + 2*Secp::NBYTES)..]);
 		let mut kaproof_challenge = [0u8; HASH_SIZE];
-		hash(&mut kaproof_challenge, &kaproof_buf[0..2*Secp::NBYTES]);
+		kaproof_buf[0..RO_TAG_SIZE].copy_from_slice(&kaproof_tag);
+		hash(&mut kaproof_challenge, &kaproof_buf[0..(2*Secp::NBYTES+RO_TAG_SIZE)]);
 		let kaproof_challenge = SecpOrd::from_bytes(&kaproof_challenge[..]);
 		let kaproof_lhs = Secp::op(&Secp::scalar_table_multi(&r_table[..], &kaproof_challenge), &kaproof_randcommitment).affine();
 		let kaproof_rhs = Secp::scalar_table_multi(&precomp::P256_TABLE[..], &kaproof_z.mul(&kb)).affine();
@@ -293,21 +328,22 @@ impl Bob2P {
 
 		// hash message
 		let mut z = [0u8; HASH_SIZE];
-		hash(&mut z, msg);
+		ecdsa_hash(&mut z, msg);
 		let z = SecpOrd::from_bytes(&z);
 
 		// perform multiplications using the extensions we just generated
-		let t1b = try!(self.ote.mul_transfer(sigid*2+0, &extensions.0[0], &extensions.1, &extensions.2[0], &extensions.3, recv));
+		let t1b = self.multiplier.mul_transfer(&[&extensions.0[0]], &extensions.1, &[&extensions.2[0]], &extensions.3, &dro, recv)?[0];
 		let gamma1 = Secp::scalar_table_multi(&r_table[..], &t1b).affine(); // start calculating gamma_b early, to give the sender extra time
-		let mut gamma1raw = [0u8;Secp::NBYTES];
-		gamma1.to_bytes(&mut gamma1raw);
+		let mut gamma1raw = [0u8;Secp::NBYTES+RO_TAG_SIZE];
+		gamma1.to_bytes(&mut gamma1raw[RO_TAG_SIZE..]);
+		gamma1raw[0..RO_TAG_SIZE].copy_from_slice(&dro.next_dyadic_tag());
 		let mut enckey = [0u8;HASH_SIZE];
 		hash(&mut enckey, &gamma1raw);
-		let t2b = try!(self.ote.mul_transfer(sigid*2+1, &extensions.0[1], &extensions.1, &extensions.2[1], &extensions.3, recv));
+		let t2b = self.multiplier.mul_transfer(&[&extensions.0[1]], &extensions.1, &[&extensions.2[1]], &extensions.3, &dro, recv)?[0];
 
 		// compute the first check messages Gamma_1, and decrypt the pad
 		let mut kapadraw = [0u8;SecpOrd::NBYTES];
-		try!(recv.read_exact(&mut kapadraw));
+		recv.read_exact(&mut kapadraw)?;
 		for ii in 0..SecpOrd::NBYTES {
 			kapadraw[ii] ^= enckey[ii];
 		}
@@ -317,8 +353,9 @@ impl Bob2P {
 		let t2bg = Secp::scalar_table_multi(&precomp::P256_TABLE[..], &t2b);
 		let t1bpk = Secp::scalar_table_multi(&self.pktable[..], &t1baug.neg());
 		let gamma2 = Secp::op(&t2bg, &t1bpk).affine();
-		let mut gamma2raw = [0u8;Secp::NBYTES];
-		gamma2.to_bytes(&mut gamma2raw);
+		let mut gamma2raw = [0u8;Secp::NBYTES+RO_TAG_SIZE];
+		gamma2.to_bytes(&mut gamma2raw[RO_TAG_SIZE..]);
+		gamma2raw[0..RO_TAG_SIZE].copy_from_slice(&dro.next_dyadic_tag());
 		hash(&mut enckey, &gamma2raw);
 
 		// compute bob's signature share m_b
@@ -326,7 +363,7 @@ impl Bob2P {
 
 		// receive alice's signature share m_a, and decrypt using expected key
 		let mut ma = [0u8; SecpOrd::NBYTES];
-		try!(recv.read_exact(&mut ma));
+		recv.read_exact(&mut ma)?;
 		for ii in 0..SecpOrd::NBYTES {
 			ma[ii] ^= enckey[ii];
 		}
@@ -347,82 +384,45 @@ impl Bob2P {
 }
 
 impl ThresholdSigner {
-	pub fn new<TR:Read+std::marker::Send+std::marker::Sync, TW:Write+std::marker::Send+std::marker::Sync>(playerindex:usize, threshold:usize, sk_frag:&SecpOrd, rng:&mut Rng, recv:&mut [Option<TR>], send:&mut [Option<TW>]) -> Result<ThresholdSigner, MPECDSAError> {
+	pub fn new<TR:Read+Send, TW:Write+Send>(playerindex:usize, threshold:usize, rng:&mut dyn Rng, recv:&mut [Option<TR>], send:&mut [Option<TW>]) -> Result<ThresholdSigner, MPECDSAError> {
 		if recv.len() != send.len() {
-			return Err(MPECDSAError::General);
+			return Err(MPECDSAError::General(GeneralError::new("Number of Send streams does not match number of Recv streams")));
 		}
 		let playercount = recv.len();
 
-		// first compute a single public key fragment, and commit to a proof that the secret key is known
-		let pk_frag = Secp::scalar_table_multi(&precomp::P256_TABLE, sk_frag);
-		let (proofcommitment, proof) = prove_dl_fs_to_com(sk_frag, &pk_frag, rng);
-		for ii in 0..playercount {
-			if ii != playerindex {
-				try!(send[ii].as_mut().unwrap().write(&proofcommitment));
-				try!(send[ii].as_mut().unwrap().flush());
-			}
-		}
-		// now collect everyone else's commitments
-		let mut othercommitments = vec![[0u8;32];playercount];
-		for ii in 0..playercount {
-			if ii != playerindex {
-				try!(recv[ii].as_mut().unwrap().read_exact(&mut othercommitments[ii]));
-			}
-		}
-		// when all commitments are in, release the proof
-		let mut pk_frag_raw = [0u8; Secp::NBYTES];
-		pk_frag.to_bytes(&mut pk_frag_raw);
-		for ii in 0..playercount {
-			if ii != playerindex {
-				try!(send[ii].as_mut().unwrap().write(&pk_frag_raw));
-				try!(send[ii].as_mut().unwrap().write(&proof));
-				try!(send[ii].as_mut().unwrap().flush());
-			}
-		}
-		// and finally verify that the proofs are valid
-		let mut pk_frags:Vec<Secp> = Vec::with_capacity(playercount);
-		let mut pk = Secp::INF;
-		for ii in 0..playercount {
-			if ii == playerindex {
-				pk_frags.push(pk_frag.clone());
-			} else {
-				try!(recv[ii].as_mut().unwrap().read_exact(&mut pk_frag_raw));
-				let this_pk_frag = Secp::from_bytes(&pk_frag_raw);
-				if try!(verify_dl_fs_with_com(&this_pk_frag, &othercommitments[ii], &mut recv[ii].as_mut().unwrap())) {
-					pk_frags.push(this_pk_frag);	
-				} else {
-					return Err(MPECDSAError::Proof(ProofError::new(&format!("Proof of Knowledge failed for player {}'s public key fragment", ii))));
-				}
-			}
-			pk = Secp::op(&pk, &pk_frags[ii]);
-		}
-		pk = pk.affine();
-		
+		let ro = {
+			let mut prunedrecv : Vec<Option<&mut TR>> = recv.iter_mut().map(|val| val.as_mut()).collect();
+			let mut prunedsend : Vec<Option<&mut TW>> = send.iter_mut().map(|val| val.as_mut()).collect();
+			GroupROTagger::from_network_unverified(playerindex, rng, &mut prunedrecv[..], &mut prunedsend[..])?
+		};
+
+		let sk_frag = SecpOrd::rand(rng);	
 
 		// Random polynomial for shamir secret sharing.
 		// This polynomial represents my secret; we will sum all the polynomials later to sum the secret.
 		// Note that we generate k-1 coefficients; the last is the secret
 		let mut coefficients:Vec<SecpOrd> = Vec::with_capacity(threshold);
+		coefficients.push(sk_frag.clone());
 		for _ in 1..threshold {
 			coefficients.push(SecpOrd::rand(rng));
 		}
 
-		// poly_point will later be our my point on the shared/summed polynomial. Create it early
+		// poly_point will later be my point on the shared/summed polynomial. Create it early
 		// so that the component from my own individual polynomial can be added.
 		let mut poly_point = SecpOrd::ZERO;
 		// evaluate my polynomial once for each player, and send everyone else their fragment
 		for ii in 0..playercount {
-			let mut poly_frag = sk_frag.clone();
-			for jj in 0..coefficients.len() {
-				poly_frag = poly_frag.add(&SecpOrd::from_native((ii+1).pow((jj+1) as u32) as u64).mul(&coefficients[jj]));
+			let mut poly_frag = coefficients[coefficients.len()-1];
+			for jj in (0..(coefficients.len()-1)).rev() {
+				poly_frag = poly_frag.mul(&SecpOrd::from_native((ii+1) as u64)).add(&coefficients[jj]);
 			}
 			if ii == playerindex {
 				poly_point = poly_frag;
 			} else {
 				let mut poly_frag_raw = [0u8;SecpOrd::NBYTES];
 				poly_frag.to_bytes(&mut poly_frag_raw);
-				try!(send[ii].as_mut().unwrap().write(&poly_frag_raw));
-				try!(send[ii].as_mut().unwrap().flush());
+				send[ii].as_mut().unwrap().write(&poly_frag_raw)?;
+				send[ii].as_mut().unwrap().flush()?;
 			}
 		}
 
@@ -430,56 +430,105 @@ impl ThresholdSigner {
 		for ii in 0..playercount {
 			if ii != playerindex {
 				let mut poly_frag_raw = [0u8;SecpOrd::NBYTES];
-				try!(recv[ii].as_mut().unwrap().read(&mut poly_frag_raw));
+				recv[ii].as_mut().unwrap().read_exact(&mut poly_frag_raw)?;
 				let poly_frag = SecpOrd::from_bytes(&poly_frag_raw);
 				poly_point = poly_point.add(&poly_frag);
 			}
 		}
 
-		// calculate p(playerindex)*G, an EC point with my polynomial point in the exponent, and broadcast it to everyone
-		let point_com = Secp::scalar_table_multi(&precomp::P256_TABLE, &poly_point);
-		let mut point_com_raw = [0u8; Secp::NBYTES];
-		point_com.to_bytes(&mut point_com_raw);
-		for ii in 0..playercount {
-			if ii != playerindex {
-				try!(send[ii].as_mut().unwrap().write(&point_com_raw));
-				try!(send[ii].as_mut().unwrap().flush());
-			}
-		}
-
-		// receive commitments to everyone's polynomial points
 		let mut points_com:Vec<Secp> = Vec::with_capacity(playercount);
-		for ii in 0..playercount {
-			if ii == playerindex {
-				points_com.push(point_com);
-			} else {
-				try!(recv[ii].as_mut().unwrap().read_exact(&mut point_com_raw));
-				points_com.push(Secp::from_bytes(&point_com_raw));
+		let mut pk = Secp::INF;
+
+		if threshold >= playercount/2 {
+			// calculate p(playerindex)*G, an EC point with my polynomial point in the exponent, and broadcast it to everyone
+			// in the dishonest majority case, we also need a PoK
+			let point_com = Secp::scalar_table_multi(&precomp::P256_TABLE, &poly_point);
+			let (proofcommitment, proof) = prove_dl_fs_to_com(&poly_point, &point_com, &ModelessGroupROTagger::new(&ro,false), rng)?;
+			for ii in 0..playercount {
+				if ii != playerindex {
+					send[ii].as_mut().unwrap().write(&proofcommitment)?;
+					send[ii].as_mut().unwrap().flush()?;
+				}
+			}
+			// now collect everyone else's commitments
+			let mut othercommitments = vec![[0u8;32];playercount];
+			for ii in 0..playercount {
+				if ii != playerindex {
+					recv[ii].as_mut().unwrap().read_exact(&mut othercommitments[ii])?;
+				}
+			}
+			// when all commitments are in, release the proof
+			let mut point_com_raw = [0u8; Secp::NBYTES];
+			point_com.to_bytes(&mut point_com_raw);
+			for ii in 0..playercount {
+				if ii != playerindex {
+					send[ii].as_mut().unwrap().write(&point_com_raw)?;
+					send[ii].as_mut().unwrap().write(&proof)?;
+					send[ii].as_mut().unwrap().flush()?;
+				}
+			}
+			// and finally verify that the proofs are valid
+			for ii in 0..playercount {
+				if ii == playerindex {
+					points_com.push(point_com);
+				} else {
+					recv[ii].as_mut().unwrap().read_exact(&mut point_com_raw)?;
+					let this_point_com = Secp::from_bytes(&point_com_raw);
+					if verify_dl_fs_with_com(&this_point_com, &othercommitments[ii], &ModelessDyadicROTagger::new(&ro.get_dyadic_tagger(ii).unwrap(),false), &mut recv[ii].as_mut().unwrap())? {
+						points_com.push(this_point_com);	
+					} else {
+						return Err(MPECDSAError::Proof(ProofError::new(&format!("Proof of Knowledge failed for player {}'s public key fragment", ii))));
+					}
+				}
+			}
+		} else {
+			// calculate p(playerindex)*G, an EC point with my polynomial point in the exponent, and broadcast it to everyone
+			let point_com = Secp::scalar_table_multi(&precomp::P256_TABLE, &poly_point);
+			let mut point_com_raw = [0u8; Secp::NBYTES];
+			point_com.to_bytes(&mut point_com_raw);
+			for ii in 0..playercount {
+				if ii != playerindex {
+					send[ii].as_mut().unwrap().write(&point_com_raw)?;
+					send[ii].as_mut().unwrap().flush()?;
+				}
+			}
+
+			// receive commitments to everyone's polynomial points
+			for ii in 0..playercount {
+				if ii == playerindex {
+					points_com.push(point_com);
+				} else {
+					recv[ii].as_mut().unwrap().read_exact(&mut point_com_raw)?;
+					points_com.push(Secp::from_bytes(&point_com_raw));
+				}
 			}
 		}
 
 		// for each contiguous set of parties, perform shamir reconsruction in the exponent and check the result against the known pk
-		for ii in 0..(playercount-threshold) {
+		for ii in 0..(playercount-threshold+1) {
 			let mut recon_sum = Secp::INF;
 			for jj in 0..threshold {
-				let mut coef = SecpOrd::ONE;
+				let mut coefnum = SecpOrd::ONE;
+				let mut coefdenom = SecpOrd::ONE;
 				// calculate lagrange coefficient
 				for kk in 0..threshold {
 					if kk != jj {
-						coef = coef.mul(&SecpOrd::from_native((ii+kk+1) as u64));
-						coef = coef.mul(&(SecpOrd::from_native((ii+kk+1) as u64).sub(&SecpOrd::from_native((ii+jj+1) as u64))).inv());
+						coefnum = coefnum.mul(&SecpOrd::from_native((ii+kk+1) as u64));
+						coefdenom = coefdenom.mul(&SecpOrd::from_native((ii+kk+1) as u64).sub(&SecpOrd::from_native((ii+jj+1) as u64)));
 					}
 				}
-				let recon_frag = points_com[ii+jj].scalar_table(&coef);
+				let recon_frag = points_com[ii+jj].scalar_table(&coefnum.mul(&coefdenom.inv()));
 				recon_sum = Secp::op(&recon_sum, &recon_frag);
 			}
 			recon_sum = recon_sum.affine();
-			if recon_sum != pk {
+			if pk == Secp::INF {
+				pk = recon_sum;
+			} else if recon_sum != pk {
 				return Err(MPECDSAError::Proof(ProofError::new("Verification failed for public key reconstruction")));
 			}
 		}
 
-		// finally, each pair of parties must have OTE setup between them. The player with the higher index is always Bob.
+		// finally, each pair of parties must have multiplier setup between them. The player with the higher index is always Bob.
 		let mut rngs = Vec::with_capacity(playercount);
 		for _ in 0..playercount {
 			let mut newrng = rand::ChaChaRng::new_unseeded();
@@ -487,61 +536,352 @@ impl ThresholdSigner {
 			rngs.push(newrng);
 		}
 
-		let threadcount = match env::var_os("RAYON_NUM_THREADS") {
-		    Some(val) => val.into_string().unwrap().parse().unwrap(),
+		let threadcount = match std::env::var_os("RAYON_NUM_THREADS") {
+		    Some(val) => {
+		    	let val = val.into_string().unwrap().parse().unwrap();
+		    	if val > 0 {
+		    		val
+		    	} else {
+		    		playercount
+		    	}
+		    },
     		None => playercount
 		};
 
 		let rayonpool = rayon::ThreadPoolBuilder::new().num_threads(threadcount).build().unwrap();
-		let otevec = rayonpool.install(|| { send.par_iter_mut().zip(recv.par_iter_mut()).zip(rngs.par_iter_mut()).enumerate().map(|(ii, ((sendi, recvi), rngi))| {
+		let multipliervec = rayonpool.install(|| { send.par_iter_mut().zip(recv.par_iter_mut()).zip(rngs.par_iter_mut()).enumerate().map(|(ii, ((sendi, recvi), rngi))| {
 			if ii > playerindex {
-				OTEPlayer::Sender(ote::OTESender::new(rngi, recvi.as_mut().unwrap(), sendi.as_mut().unwrap()).unwrap())
+				MulPlayer::Sender(mul::MulSender::new(&ro.get_dyadic_tagger(ii).unwrap(), rngi, recvi.as_mut().unwrap(), sendi.as_mut().unwrap()).unwrap())
 			} else if ii < playerindex {
-				OTEPlayer::Recver(ote::OTERecver::new(rngi, recvi.as_mut().unwrap(), sendi.as_mut().unwrap()).unwrap())
+				MulPlayer::Recver(mul::MulRecver::new(&ro.get_dyadic_tagger(ii).unwrap(), rngi, recvi.as_mut().unwrap(), sendi.as_mut().unwrap()).unwrap())
 			} else {
-				OTEPlayer::Null
+				MulPlayer::Null
 			}
 		}).collect() });
 
-		let mut sigids = Vec::with_capacity(playercount);
-		for _ in 0..playercount {
-			sigids.push(AtomicUsize::new(0));
-		}
- 
  		let pktable = Secp::precomp_table(&pk);
 		Ok(ThresholdSigner {
+			ro: ro,
 			playerindex: playerindex,
 			threshold: threshold,
-			ote: otevec,
+			multiplier: multipliervec,
 			poly_point: poly_point,
 			pk: pk,
-			pktable: pktable,
-			sigids: sigids,
+			pktable: pktable
 		})
 	}
 
-	pub fn sign<TR:Read, TW:Write+std::marker::Send>(&self, counterparties: &[usize], msg:&[u8], rng:&mut Rng, recv:&mut TR, send:&mut TW) -> Result<Option<(SecpOrd, SecpOrd)>,MPECDSAError> {
+	pub fn sign<TR:Read+Send, TW:Write+Send>(&mut self, counterparties: &[usize], msg:&[u8], rng:&mut dyn Rng, recv:&mut [Option<TR>], send:&mut [Option<TW>]) -> Result<Option<(SecpOrd, SecpOrd)>,MPECDSAError> {
 		if counterparties.len() != (self.threshold-1) {
-			return Err(MPECDSAError::General);
+			return Err(MPECDSAError::General(GeneralError::new("Number of counterparties does not match threshold.")));
 		}
 
 		if self.threshold == 2 {
 			let counterparty = counterparties[0];
 			if self.playerindex > counterparty {
-				return Ok(Some(try!(self.sign2t_bob(counterparty, msg, rng, recv, send))));
+				return Ok(Some(self.sign2t_bob(counterparty, msg, rng, &mut recv[counterparty].as_mut().unwrap(), &mut send[counterparty].as_mut().unwrap())?));
 			} else if self.playerindex < counterparty {
-				try!(self.sign2t_alice(counterparty, msg, rng, recv, send));
+				self.sign2t_alice(counterparty, msg, rng, &mut recv[counterparty].as_mut().unwrap(), &mut send[counterparty].as_mut().unwrap())?;
 				return Ok(None);
 			} else {
-				return Err(MPECDSAError::General);
+				return Err(MPECDSAError::General(GeneralError::new("Tried to sign with self as counterparty.")));
 			}
 		} else {
-			return Err(MPECDSAError::General);
+			let mut parties: Vec<usize> = counterparties.to_vec();
+			parties.push(self.playerindex);
+			parties.sort();
+			return Ok(Some(self.sign_threshold(&parties, msg, rng, recv, send)?));
 		}
 	}
 
-	fn sign2t_alice<TR:Read, TW:Write+std::marker::Send>(&self, counterparty: usize, msg:&[u8], rng:&mut Rng, recv:&mut TR, send:&mut TW) -> Result<(),MPECDSAError> {
-		let sigid = self.sigids[counterparty].fetch_add(1, Ordering::Relaxed);
+	fn sign_threshold<TR:Read+Send, TW:Write+Send>(&mut self, counterparties: &[usize], msg:&[u8], rng:&mut dyn Rng, recv:&mut [Option<TR>], send:&mut [Option<TW>]) -> Result<(SecpOrd, SecpOrd),MPECDSAError> {
+		self.ro.apply_subgroup_list(counterparties)?;
+		let sroindex = self.ro.current_broadcast_counter();
+
+		let ki = SecpOrd::rand(rng);
+		let kipad = SecpOrd::rand(rng);
+		let kii = ki.inv();
+		let kipadki = kii.mul(&kipad);
+
+		// create reduced sets of resources for the multipliers
+		let mut prunedrecv : Vec<&mut Option<TR>> = recv.iter_mut().enumerate().filter_map(|(index, val)| if counterparties.contains(&index) {Some(val)} else {None}).collect();
+		let mut prunedsend : Vec<&mut Option<TW>> = send.iter_mut().enumerate().filter_map(|(index, val)| if counterparties.contains(&index) {Some(val)} else {None}).collect();
+		let mut prunedmultiplier : Vec<&mul::MulPlayer> = self.multiplier.iter().enumerate().filter_map(|(index, val)| if counterparties.contains(&index) {Some(val)} else {None}).collect();
+		let tempplayeri = self.playerindex;
+		let prunedplayerindex = counterparties.iter().position(|&x| x == tempplayeri).unwrap();
+
+		//instance key and inverse instance key multiplication
+		
+		let threadcount = match std::env::var_os("RAYON_NUM_THREADS") {
+		    Some(val) => {
+		    	let val = val.into_string().unwrap().parse().unwrap();
+		    	if val > 0 {
+		    		val
+		    	} else {
+		    		counterparties.len()
+		    	}
+		    },
+			None => counterparties.len()
+		};
+
+		let rayonpool = rayon::ThreadPoolBuilder::new().num_threads(threadcount).build().unwrap();
+
+		// message 1 send+recv, message 2 send
+		let prodshares = mprmul_round_one(4, prunedplayerindex, &mut prunedmultiplier, &self.ro, rng, &mut prunedrecv.as_mut_slice(), &mut prunedsend.as_mut_slice(), &rayonpool)?;
+
+		let mut helpfulsendbuffer = vec![Some(Cursor::new(Vec::new())); counterparties.len()];
+
+		{
+			let prodshares1: Vec<&[SecpOrd]> = prodshares.iter().map(|x| if x.0.len() > 0 {
+				&x.0[0..2]
+			} else {
+				&x.0[..]
+			}).collect();
+
+			// message 2 send
+			mpmul_first(&[ki, kipadki], prunedplayerindex, prodshares1.as_slice(), helpfulsendbuffer.iter_mut().collect::<Vec<_>>().as_mut_slice())?;
+		}
+
+		let helpfulsentbuffer = helpfulsendbuffer.into_iter().map(|x| x.unwrap().into_inner()).collect();
+
+		// message 2 recv
+		let linshares = mprmul_round_two(prunedplayerindex, &prodshares, &mut prunedmultiplier, &self.ro, rng, &mut prunedrecv.as_mut_slice(), &mut prunedsend.as_mut_slice(), &rayonpool, Some(helpfulsentbuffer))?;
+
+		let shares: Vec<Vec<(SecpOrd,SecpOrd)>> = prodshares.into_iter().zip(linshares.into_iter()).map(|(prodel,linel)|  {
+			prodel.0.into_iter().zip(linel.into_iter()).collect()
+		}).collect();
+
+		let shares1: Vec<&[(SecpOrd,SecpOrd)]> = shares.iter().map(|x| if x.len() > 0 {
+			&x[0..2]
+		} else {
+			&x[..]
+		}).collect();
+
+		let shares2: Vec<&[(SecpOrd,SecpOrd)]> = shares.iter().map(|x| if x.len() > 0 {
+			&x[2..4]
+		} else {
+			&x[..]
+		}).collect();
+
+		// message 2 recv, message 3 to log(n)+1 send+recv
+		let mulresult = mpmul_rest(&[ki, kipadki], prunedplayerindex, shares1.as_slice(), &mut prunedrecv.as_mut_slice(), &mut prunedsend.as_mut_slice())?;
+		let ui = mulresult[0];
+		let vi = mulresult[1];
+
+		let mut coefnum = SecpOrd::ONE;
+		let mut coefdenom = SecpOrd::ONE;
+		// calculate lagrange coefficient
+		for kk in 0..self.threshold {
+			if kk != prunedplayerindex {
+				coefnum = coefnum.mul(&SecpOrd::from_native((counterparties[kk]+1) as u64));
+				coefdenom = coefdenom.mul(&SecpOrd::from_native((counterparties[kk]+1) as u64).sub(&SecpOrd::from_native((self.playerindex+1) as u64)));
+			}
+		}
+		let zi = self.poly_point.mul(&coefnum.mul(&coefdenom.inv()));
+
+		//secret key multiplication, step one
+		// message log(n)+2 send
+		mpswapmul_send(&[(vi, zi)], prunedplayerindex, shares2.as_slice(), &mut prunedsend.as_mut_slice())?;
+
+		//R and phi commitment, plus broadcast RO sync
+		let ri = Secp::scalar_table_multi(&precomp::P256_TABLE[..], &ui).affine();
+		let mut pad_raw = [0u8; SecpOrd::NBYTES + RO_TAG_SIZE];
+		let mut ri_raw = [0u8; Secp::NBYTES + RO_TAG_SIZE];
+		kipad.to_bytes(&mut pad_raw[RO_TAG_SIZE..]);
+		ri.to_bytes(&mut ri_raw[RO_TAG_SIZE..]);
+
+		let mut hashout = [0u8;HASH_SIZE];
+		let mut doublecom = vec![[0u8;2*HASH_SIZE]; self.threshold];
+		ri_raw[0..RO_TAG_SIZE].copy_from_slice(&self.ro.next_broadcast_tag());
+		pad_raw[0..RO_TAG_SIZE].copy_from_slice(&self.ro.next_broadcast_tag());
+		hash(&mut hashout, &ri_raw);
+		doublecom[prunedplayerindex][HASH_SIZE..2*HASH_SIZE].copy_from_slice(&hashout[..]);
+		hash(&mut hashout, &pad_raw);
+		doublecom[prunedplayerindex][0..HASH_SIZE].copy_from_slice(&hashout[..]);
+		
+
+		// synchronize the random oracles
+		let mut sroindex_raw  = [0u8;8];
+		LittleEndian::write_u64(&mut sroindex_raw, sroindex);
+
+		for ii in 0..self.threshold {
+			if ii != prunedplayerindex {
+				// message log(n)+2 send
+				prunedsend[ii].as_mut().unwrap().write(&sroindex_raw)?;
+				prunedsend[ii].as_mut().unwrap().write(&doublecom[prunedplayerindex])?;
+				prunedsend[ii].as_mut().unwrap().flush()?;
+			}
+		}
+
+		//secret key multiplication, step two
+		// message log(n)+2 recv
+		let wi = mpswapmul_recv(&[(vi, zi)], prunedplayerindex, shares2.as_slice(), &mut prunedrecv.as_mut_slice())?[0];
+
+		// receive commitments to kjpad, rj, poks
+		for ii in 0..self.threshold {
+			if ii != prunedplayerindex {
+				// message log(n)+2 recv
+				prunedrecv[ii].as_mut().unwrap().read_exact(&mut sroindex_raw)?;
+				self.ro.advance_counterparty_broadcast_counter(counterparties[ii], LittleEndian::read_u64(&sroindex_raw))?;
+				prunedrecv[ii].as_mut().unwrap().read_exact(&mut doublecom[ii])?;
+			}
+		}
+
+		// release ri + pok
+		for ii in 0..self.threshold {
+			if ii != prunedplayerindex {
+				// message log(n)+3 send
+				prunedsend[ii].as_mut().unwrap().write(&ri_raw[RO_TAG_SIZE..])?;
+				prunedsend[ii].as_mut().unwrap().flush()?;
+			}
+		}
+
+		// receive rj + pok and verify against commitment
+		let mut r = ri;
+		let mut rjs = vec![Secp::INF; self.threshold];
+		for ii in 0..self.threshold {
+			if ii != prunedplayerindex {
+				// message log(n)+3 recv
+				prunedrecv[ii].as_mut().unwrap().read_exact(&mut ri_raw[RO_TAG_SIZE..])?;
+				ri_raw[0..RO_TAG_SIZE].copy_from_slice(&self.ro.next_counterparty_broadcast_tag(ii)?);
+				hash(&mut hashout, &ri_raw);
+				if hashout != doublecom[ii][HASH_SIZE..2*HASH_SIZE] {
+					return Err(MPECDSAError::Proof(ProofError::new(&format!("Player {} failed to decommit R", counterparties[ii]))));
+				}
+				rjs[ii] = Secp::from_bytes(&ri_raw[RO_TAG_SIZE..]);
+				r = Secp::op(&r, &rjs[ii]).affine();
+			}
+		}
+
+		// message log(n)+3 recv
+
+		let r_table = Secp::precomp_table(&r);
+		let mut checkpt1 = Secp::scalar_table_multi(&r_table[..], &vi).affine();
+		let mut checkpt2 = Secp::op(&Secp::scalar_table_multi(&self.pktable[..], &vi), &Secp::scalar_table_multi(&precomp::P256_TABLE[..], &wi).neg()).affine();
+		let mut checkpt3 = Secp::scalar_table_multi(&r_table[..], &wi).affine();
+		
+		let mut checkpt123_raw = [0u8; 3*Secp::NBYTES+RO_TAG_SIZE];
+		checkpt1.to_bytes(&mut checkpt123_raw[RO_TAG_SIZE..(Secp::NBYTES+RO_TAG_SIZE)]);
+		checkpt2.to_bytes(&mut checkpt123_raw[(Secp::NBYTES+RO_TAG_SIZE)..(2*Secp::NBYTES+RO_TAG_SIZE)]);
+		checkpt3.to_bytes(&mut checkpt123_raw[(2*Secp::NBYTES+RO_TAG_SIZE)..(3*Secp::NBYTES+RO_TAG_SIZE)]);
+		let mut checkpt123_coms  = vec![[0u8; HASH_SIZE]; self.threshold];
+		checkpt123_raw[0..RO_TAG_SIZE].copy_from_slice(&self.ro.next_broadcast_tag());
+		hash(&mut checkpt123_coms[prunedplayerindex], &checkpt123_raw);
+		// send commitment
+		for ii in 0..self.threshold {
+			if ii != prunedplayerindex {
+				// message log(n)+4 send
+				prunedsend[ii].as_mut().unwrap().write(&checkpt123_coms[prunedplayerindex])?;
+				prunedsend[ii].as_mut().unwrap().flush()?;
+			}
+		}
+
+		// receive commitments checkpts
+		for ii in 0..self.threshold {
+			if ii != prunedplayerindex {
+				// message log(n)+4 recv
+				prunedrecv[ii].as_mut().unwrap().read_exact(&mut checkpt123_coms[ii])?;
+			}
+		}
+
+		// release kipad and checkpts
+		for ii in 0..self.threshold {
+			if ii != prunedplayerindex {
+				// message log(n)+5 send
+				prunedsend[ii].as_mut().unwrap().write(&pad_raw[(RO_TAG_SIZE)..])?;
+				prunedsend[ii].as_mut().unwrap().write(&checkpt123_raw[(RO_TAG_SIZE)..])?;
+				prunedsend[ii].as_mut().unwrap().flush()?;
+			}
+		}
+
+		// receive kjpad and verify against commitment
+		let mut kpad = kipad;
+		for ii in 0..self.threshold {
+			if ii != prunedplayerindex {
+				let mut comcomp = [0u8;HASH_SIZE];
+				pad_raw[0..RO_TAG_SIZE].copy_from_slice(&self.ro.next_counterparty_broadcast_tag(ii)?);
+				// message log(n)+5 recv
+				prunedrecv[ii].as_mut().unwrap().read_exact(&mut pad_raw[RO_TAG_SIZE..])?;
+				hash(&mut comcomp, &pad_raw);
+				let kjpad = SecpOrd::from_bytes(&pad_raw[RO_TAG_SIZE..]);
+				if comcomp == doublecom[ii][0..HASH_SIZE] {
+					kpad = kpad.mul(&kjpad);
+				} else {
+					return Err(MPECDSAError::Proof(ProofError::new(&format!("Player {} failed to decommit multiplication pad", counterparties[ii]))));
+				}
+
+				checkpt123_raw[0..RO_TAG_SIZE].copy_from_slice(&self.ro.next_counterparty_broadcast_tag(ii)?);
+				// message log(n)+5 recv
+				prunedrecv[ii].as_mut().unwrap().read_exact(&mut checkpt123_raw[RO_TAG_SIZE..])?;
+				hash(&mut comcomp, &checkpt123_raw);
+				if comcomp == checkpt123_coms[ii] {
+					let checkpt1_frag = Secp::from_bytes(&checkpt123_raw[RO_TAG_SIZE..(Secp::NBYTES+RO_TAG_SIZE)]);
+					let checkpt2_frag = Secp::from_bytes(&checkpt123_raw[(Secp::NBYTES+RO_TAG_SIZE)..(2*Secp::NBYTES+RO_TAG_SIZE)]);
+					let checkpt3_frag = Secp::from_bytes(&checkpt123_raw[(2*Secp::NBYTES+RO_TAG_SIZE)..(3*Secp::NBYTES+RO_TAG_SIZE)]);
+					checkpt1 = Secp::op(&checkpt1, &checkpt1_frag).affine();
+					checkpt2 = Secp::op(&checkpt2, &checkpt2_frag).affine();
+					checkpt3 = Secp::op(&checkpt3, &checkpt3_frag).affine();
+				} else {
+					return Err(MPECDSAError::Proof(ProofError::new(&format!("Player {} failed to decommit consistency checks", counterparties[ii]))));
+				}
+			}
+		}
+
+		if kpad == SecpOrd::ZERO {
+			return Err(MPECDSAError::Proof(ProofError::new(&"Multicplication pad value was zero")));
+		}
+
+		if checkpt1.affine() != Secp::scalar_table_multi(&precomp::P256_TABLE[..], &kpad).affine() {
+			return Err(MPECDSAError::Proof(ProofError::new(&"First consistency check failed")));
+		}
+
+		if !checkpt2.is_infinity() {
+			return Err(MPECDSAError::Proof(ProofError::new(&"Second consistency check failed")));
+		}
+
+		if checkpt3 != Secp::scalar_table_multi(&self.pktable, &kpad).affine() {
+			return Err(MPECDSAError::Proof(ProofError::new(&"Third consistency check failed")));
+		}
+
+		// hash the message
+		let mut z = [0; HASH_SIZE];
+		ecdsa_hash(&mut z, msg);
+		let z = SecpOrd::from_bytes(&z);
+
+		let mut rxb = [0u8; SecpOrd::NBYTES];
+		r.x.to_bytes(&mut rxb);
+		let rx = SecpOrd::from_bytes(&rxb);
+
+		let wiaug = wi.mul(&kpad.inv());
+		let mut sig = z.mul(&vi).mul(&kpad.inv()).add(&wiaug.mul(&rx));
+		let mut sig_frag_raw = [0u8;SecpOrd::NBYTES];
+		sig.to_bytes(&mut sig_frag_raw);
+
+		for ii in 0..self.threshold {
+			if ii != prunedplayerindex {
+				// message log(n)+6 send
+				prunedsend[ii].as_mut().unwrap().write(&sig_frag_raw)?;
+				prunedsend[ii].as_mut().unwrap().flush()?;
+			}
+		}
+
+		for ii in 0..self.threshold {
+			if ii != prunedplayerindex {
+				// message log(n)+6 recv
+				prunedrecv[ii].as_mut().unwrap().read_exact(&mut sig_frag_raw)?;
+				let sig_frag = SecpOrd::from_bytes(&sig_frag_raw);
+				sig = sig.add(&sig_frag);
+			}
+		}
+
+		if ecdsa::ecdsa_verify_with_tables(msg, (&rx, &sig), &precomp::P256_TABLE, &self.pktable[..]) {
+			Ok((rx, sig))
+		} else {
+			Err(MPECDSAError::Proof(ProofError::new("Signature verification failed for ECDSA signing")))
+		}
+	}
+
+	fn sign2t_alice<TR:Read, TW:Write+Send>(&self, counterparty: usize, msg:&[u8], rng:&mut dyn Rng, recv:&mut TR, send:&mut TW) -> Result<(),MPECDSAError> {
 		let mut bufsend = BufWriter::new(send);
 
 		// precompute things you won't need till later
@@ -554,7 +894,7 @@ impl ThresholdSigner {
 
 		// hash the message
 		let mut z = [0; HASH_SIZE];
-		hash(&mut z, msg);
+		ecdsa_hash(&mut z, msg);
 		let z = SecpOrd::from_bytes(&z);
 
 		// calculate lagrange coefficient
@@ -562,22 +902,24 @@ impl ThresholdSigner {
 		coef = coef.mul(&(SecpOrd::from_native((counterparty+1) as u64).sub(&SecpOrd::from_native((self.playerindex+1) as u64))).inv());
 		let t0a = coef.mul(&self.poly_point);
 
-		let ote = match self.ote[counterparty] {
-			OTEPlayer::Sender(ref ote) => ote,
-			_ => return Err(MPECDSAError::General)
+		let multiplier = match self.multiplier[counterparty] {
+			MulPlayer::Sender(ref multiplier) => multiplier,
+			_ => return Err(MPECDSAError::General(GeneralError::new("Alice was given Recver half of multiplier protocol.")))
 		};
 
 		// online phase
+		let dro = self.ro.get_dyadic_tagger(counterparty).unwrap();
 
 		// recv D_b from bob
 		let mut dbraw = [0u8; Secp::NBYTES];
-		try!(recv.read_exact(&mut dbraw));
+		recv.read_exact(&mut dbraw)?;
 		let db = Secp::from_bytes(&dbraw);
 		let dbtable = Secp::precomp_table(&db);
 
 		let rprime = Secp::scalar_table_multi(&dbtable[..],&kaprime).affine();
-		let mut rprimeraw = [0u8;Secp::NBYTES];
-		rprime.to_bytes(&mut rprimeraw);
+		let mut rprimeraw = [0u8;Secp::NBYTES+RO_TAG_SIZE];
+		rprime.to_bytes(&mut rprimeraw[RO_TAG_SIZE..]);
+		rprimeraw[0..RO_TAG_SIZE].copy_from_slice(&dro.next_dyadic_tag());
 		let mut kaoffsetraw = [0u8;HASH_SIZE];
 		hash(&mut kaoffsetraw, &rprimeraw);
 		let kaoffset = SecpOrd::from_bytes(&kaoffsetraw);
@@ -597,40 +939,40 @@ impl ThresholdSigner {
 
 		// Prove knowledge of ka for R; hardcoded fiat-shamir so we can do preprocessing
 		let kaproof_randcommitted = SecpOrd::rand(rng);
-		let mut kaproof_buf = [0u8;2*Secp::NBYTES + SecpOrd::NBYTES];
+		let mut kaproof_buf = [0u8;2*Secp::NBYTES + SecpOrd::NBYTES + RO_TAG_SIZE];
 		let kaproof_randcommitment = Secp::scalar_table_multi(&dbtable[..], &kaproof_randcommitted);
-		kaproof_randcommitment.to_bytes(&mut kaproof_buf[Secp::NBYTES..2*Secp::NBYTES]);
-		r.to_bytes(&mut kaproof_buf[0..Secp::NBYTES]);
+		kaproof_randcommitment.to_bytes(&mut kaproof_buf[(RO_TAG_SIZE + Secp::NBYTES)..(RO_TAG_SIZE + 2*Secp::NBYTES)]);
+		r.to_bytes(&mut kaproof_buf[RO_TAG_SIZE..(RO_TAG_SIZE + Secp::NBYTES)]);
+		kaproof_buf[0..RO_TAG_SIZE].copy_from_slice(&dro.next_dyadic_tag());
 		let mut kaproof_challenge = [0u8; HASH_SIZE];
-		hash(&mut kaproof_challenge, &kaproof_buf[0..2*Secp::NBYTES]);
+		hash(&mut kaproof_challenge, &kaproof_buf[0..(2*Secp::NBYTES+RO_TAG_SIZE)]);
 		let kaproof_challenge = SecpOrd::from_bytes(&kaproof_challenge[..]);
 		let kaproof_z = ka.mul(&kaproof_challenge).add(&kaproof_randcommitted);
-		kaproof_z.to_bytes(&mut kaproof_buf[2*Secp::NBYTES..]);
+		kaproof_z.to_bytes(&mut kaproof_buf[(RO_TAG_SIZE + 2*Secp::NBYTES)..]);
 
 		// generate OT extensions for two multiplications (input independent for alice)
-		let extensions = try!(ote.mul_extend(sigid, 2, recv));
+		let extensions = multiplier.mul_extend(2, &dro, recv)?;
 
 		// end first message (bob to alice)
 
 		// alice sends D'_a = k'_a*G rather than D_a so that bob can check her work
-		try!(bufsend.write(&rprimeraw));
-		try!(bufsend.write(&kaproof_buf[Secp::NBYTES..]));
-		try!(bufsend.flush());
+		bufsend.write(&rprimeraw[RO_TAG_SIZE..])?;
+		bufsend.write(&kaproof_buf[(RO_TAG_SIZE + Secp::NBYTES)..])?;
+		bufsend.flush()?;
 
 		// perform two multiplications with 1/k_a and sk_a/k_a.
-		// perform two multiplications with 1/k_a and sk_a/k_a.
-		let t1a = try!(ote.mul_transfer(sigid*3+0, &kai.add(&kapad), &extensions.0[0], &extensions.1, rng, &mut bufsend));
-		try!(bufsend.flush());
-		let t2aa = try!(ote.mul_transfer(sigid*3+1, &t0ai, &extensions.0[0], &extensions.1, rng, &mut bufsend));
-		try!(bufsend.flush());
-		let t2ba = try!(ote.mul_transfer(sigid*3+2, &kai, &extensions.0[1], &extensions.1, rng, &mut bufsend));
-		try!(bufsend.flush());
+		let t12 = multiplier.mul_transfer(&[&kai.add(&kapad),&t0ai,&kai], &[&extensions.0[0],&extensions.0[0],&extensions.0[1]], &extensions.1, &dro, rng, &mut bufsend)?;
+		bufsend.flush()?;
+		let t1a = t12[0];
+		let t2aa = t12[1];
+		let t2ba = t12[2];
 		let t2a = t2aa.add(&t2ba);
 
 		// compute check value Gamma_1 for alice
 		let gamma1 = Secp::op( &Secp::op( &Secp::scalar_table_multi(&r_table[..], &t1a.neg()), &kapadda ), &Secp::gen()).affine();
-		let mut gamma1raw = [0u8;Secp::NBYTES];
-		gamma1.to_bytes(&mut gamma1raw);
+		let mut gamma1raw = [0u8;Secp::NBYTES+RO_TAG_SIZE];
+		gamma1.to_bytes(&mut gamma1raw[RO_TAG_SIZE..]);
+		gamma1raw[0..RO_TAG_SIZE].copy_from_slice(&dro.next_dyadic_tag());
 		let mut enckey = [0u8;HASH_SIZE];
 		hash(&mut enckey, &gamma1raw);
 		let mut kapadraw = [0u8;SecpOrd::NBYTES];
@@ -638,8 +980,8 @@ impl ThresholdSigner {
 		for ii in 0..SecpOrd::NBYTES {
 			kapadraw[ii] ^= enckey[ii];
 		}
-		try!(bufsend.write(&kapadraw));
-		try!(bufsend.flush());
+		bufsend.write(&kapadraw)?;
+		bufsend.flush()?;
 
 		// compute signature share m_a for alice
 		let mut ma = [0u8;SecpOrd::NBYTES];
@@ -650,29 +992,29 @@ impl ThresholdSigner {
 		let t2ag = Secp::scalar_table_multi(&precomp::P256_TABLE[..], &t2a.neg());
 		let t1apk = Secp::scalar_table_multi(&self.pktable[..], &t1a);
 		let gamma2 = Secp::op(&t2ag, &t1apk).affine();
-		let mut gamma2raw = [0u8;Secp::NBYTES];
-		gamma2.to_bytes(&mut gamma2raw);
+		let mut gamma2raw = [0u8;Secp::NBYTES+RO_TAG_SIZE];
+		gamma2.to_bytes(&mut gamma2raw[RO_TAG_SIZE..]);
+		gamma2raw[0..RO_TAG_SIZE].copy_from_slice(&dro.next_dyadic_tag());
 		hash(&mut enckey, &gamma2raw);
 		for ii in 0..SecpOrd::NBYTES {
 			ma[ii] ^= enckey[ii];
 		}
 
 		// send encrypted signature share
-		try!(bufsend.write(&ma));
-		try!(bufsend.flush());
+		bufsend.write(&ma)?;
+		bufsend.flush()?;
 
 		// end second message (alice to bob)
 
 		Ok(())
 	}
 
-	fn sign2t_bob <TR: Read, TW: Write>(&self, counterparty: usize, msg:&[u8], rng:&mut Rng, recv: &mut TR, send: &mut TW) -> Result<(SecpOrd, SecpOrd),MPECDSAError> {
-		let sigid = self.sigids[counterparty].fetch_add(1, Ordering::Relaxed);
+	fn sign2t_bob <TR: Read, TW: Write>(&self, counterparty: usize, msg:&[u8], rng:&mut dyn Rng, recv: &mut TR, send: &mut TW) -> Result<(SecpOrd, SecpOrd),MPECDSAError> {
 		let mut bufsend = BufWriter::new(send);
 
-		let ote = match self.ote[counterparty] {
-			OTEPlayer::Recver(ref ote) => ote,
-			_ => return Err(MPECDSAError::General)
+		let multiplier = match self.multiplier[counterparty] {
+			MulPlayer::Recver(ref multiplier) => multiplier,
+			_ => return Err(MPECDSAError::General(GeneralError::new("Bob was given Sender half of multiplier protocol.")))
 		};
 		// no precomputation - we want to begin writing as soon as possible
 
@@ -681,27 +1023,32 @@ impl ThresholdSigner {
 		let db = Secp::scalar_table_multi(&precomp::P256_TABLE[..], &kb);
 		let mut dbraw = [0u8; Secp::NBYTES];
 		db.to_bytes(&mut dbraw);
-		try!(bufsend.write(&dbraw));
-		try!(bufsend.flush());
+		bufsend.write(&dbraw)?;
+		bufsend.flush()?;
 
 		// calculate lagrange coefficient
 		let mut coef = SecpOrd::from_native((counterparty+1) as u64);
 		coef = coef.mul(&(SecpOrd::from_native((counterparty+1) as u64).sub(&SecpOrd::from_native((self.playerindex+1) as u64))).inv());
 		let t0b = coef.mul(&self.poly_point);
 
+		let dro = self.ro.get_dyadic_tagger(counterparty).unwrap();
+		let rprime_tag = dro.next_dyadic_tag();
+		let kaproof_tag = dro.next_dyadic_tag();
+
 		// generate OT extensions for multiplications with 1/k_b and sk_b/k_b
 		let kbi  = kb.inv();
 		let t0bi = kbi.mul(&t0b);
 		let betas = [kbi.clone(), t0bi.clone()];
-		let extensions = try!(ote.mul_encode_and_extend(sigid, &betas, rng, &mut bufsend));
-		try!(bufsend.flush());
+		let extensions = multiplier.mul_encode_and_extend(&betas, &dro, rng, &mut bufsend)?;
+		bufsend.flush()?;
 
 		// end first message (bob to alice)
 
 		// receive D'_a from alice, calculate D_a as D_a = H(D'_a)*G + D'_a
-		let mut rprimeraw = [0u8;Secp::NBYTES];
-		try!(recv.read_exact(&mut rprimeraw));
-		let rprime = Secp::from_bytes(&rprimeraw);
+		let mut rprimeraw = [0u8;Secp::NBYTES+RO_TAG_SIZE];
+		recv.read_exact(&mut rprimeraw[RO_TAG_SIZE..])?;
+		rprimeraw[0..RO_TAG_SIZE].copy_from_slice(&rprime_tag);
+		let rprime = Secp::from_bytes(&rprimeraw[RO_TAG_SIZE..]);
 		let mut kaoffsetraw = [0u8;HASH_SIZE];
 		hash(&mut kaoffsetraw, &rprimeraw);
 		let kaoffset = SecpOrd::from_bytes(&kaoffsetraw);
@@ -715,13 +1062,14 @@ impl ThresholdSigner {
 		let r_table = Secp::precomp_table(&r);
 
 		// verify alice's PoK of k_a for R
-		let mut kaproof_buf = [0u8;2*Secp::NBYTES + SecpOrd::NBYTES];
-		r.to_bytes(&mut kaproof_buf[0..Secp::NBYTES]);
-		try!(recv.read_exact(&mut kaproof_buf[Secp::NBYTES..]));
-		let kaproof_randcommitment = Secp::from_bytes(&kaproof_buf[Secp::NBYTES..2*Secp::NBYTES]);
-		let kaproof_z = SecpOrd::from_bytes(&kaproof_buf[2*Secp::NBYTES..]);
+		let mut kaproof_buf = [0u8;2*Secp::NBYTES + SecpOrd::NBYTES+RO_TAG_SIZE];
+		kaproof_buf[0..RO_TAG_SIZE].copy_from_slice(&kaproof_tag);
+		r.to_bytes(&mut kaproof_buf[RO_TAG_SIZE..(Secp::NBYTES+RO_TAG_SIZE)]);
+		recv.read_exact(&mut kaproof_buf[(RO_TAG_SIZE + Secp::NBYTES)..])?;
+		let kaproof_randcommitment = Secp::from_bytes(&kaproof_buf[(RO_TAG_SIZE + Secp::NBYTES)..(RO_TAG_SIZE + 2*Secp::NBYTES)]);
+		let kaproof_z = SecpOrd::from_bytes(&kaproof_buf[(RO_TAG_SIZE + 2*Secp::NBYTES)..]);
 		let mut kaproof_challenge = [0u8; HASH_SIZE];
-		hash(&mut kaproof_challenge, &kaproof_buf[0..2*Secp::NBYTES]);
+		hash(&mut kaproof_challenge, &kaproof_buf[0..(2*Secp::NBYTES+RO_TAG_SIZE)]);
 		let kaproof_challenge = SecpOrd::from_bytes(&kaproof_challenge[..]);
 		let kaproof_lhs = Secp::op(&Secp::scalar_table_multi(&r_table[..], &kaproof_challenge), &kaproof_randcommitment).affine();
 		let kaproof_rhs = Secp::scalar_table_multi(&precomp::P256_TABLE[..], &kaproof_z.mul(&kb)).affine();
@@ -731,23 +1079,25 @@ impl ThresholdSigner {
 
 		// hash message
 		let mut z = [0u8; HASH_SIZE];
-		hash(&mut z, msg);
+		ecdsa_hash(&mut z, msg);
 		let z = SecpOrd::from_bytes(&z);
 
 		// perform multiplications using the extensions we just generated
-		let t1b = try!(ote.mul_transfer(sigid*3+0, &extensions.0[0], &extensions.1, &extensions.2[0], &extensions.3, recv));
+		let t12 = multiplier.mul_transfer(&[&extensions.0[0],&extensions.0[0],&extensions.0[1]], &extensions.1, &[&extensions.2[0],&extensions.2[0],&extensions.2[1]], &extensions.3, &dro, recv)?;
+		let t1b = t12[0];
+		let t2ab = t12[1];
+		let t2bb = t12[2];
+		let t2b = t2ab.add(&t2bb);
 		let gamma1 = Secp::scalar_table_multi(&r_table[..], &t1b).affine(); // start calculating gamma_b early, to give the sender extra time
-		let mut gamma1raw = [0u8;Secp::NBYTES];
-		gamma1.to_bytes(&mut gamma1raw);
+		let mut gamma1raw = [0u8;Secp::NBYTES+RO_TAG_SIZE];
+		gamma1.to_bytes(&mut gamma1raw[RO_TAG_SIZE..]);
+		gamma1raw[0..RO_TAG_SIZE].copy_from_slice(&dro.next_dyadic_tag());
 		let mut enckey = [0u8;HASH_SIZE];
 		hash(&mut enckey, &gamma1raw);
-		let t2ab = try!(ote.mul_transfer(sigid*3+1, &extensions.0[0], &extensions.1, &extensions.2[0], &extensions.3, recv));
-		let t2bb = try!(ote.mul_transfer(sigid*3+2, &extensions.0[1], &extensions.1, &extensions.2[1], &extensions.3, recv));
-		let t2b = t2ab.add(&t2bb);
 
 		// compute the first check messages Gamma_1, and decrypt the pad
 		let mut kapadraw = [0u8;SecpOrd::NBYTES];
-		try!(recv.read_exact(&mut kapadraw));
+		recv.read_exact(&mut kapadraw)?;
 		for ii in 0..SecpOrd::NBYTES {
 			kapadraw[ii] ^= enckey[ii];
 		}
@@ -757,8 +1107,9 @@ impl ThresholdSigner {
 		let t2bg = Secp::scalar_table_multi(&precomp::P256_TABLE[..], &t2b);
 		let t1bpk = Secp::scalar_table_multi(&self.pktable[..], &t1baug.neg());
 		let gamma2 = Secp::op(&t2bg, &t1bpk).affine();
-		let mut gamma2raw = [0u8;Secp::NBYTES];
-		gamma2.to_bytes(&mut gamma2raw);
+		let mut gamma2raw = [0u8;Secp::NBYTES+RO_TAG_SIZE];
+		gamma2.to_bytes(&mut gamma2raw[RO_TAG_SIZE..]);
+		gamma2raw[0..RO_TAG_SIZE].copy_from_slice(&dro.next_dyadic_tag());
 		hash(&mut enckey, &gamma2raw);
 
 		// compute bob's signature share m_b
@@ -766,7 +1117,7 @@ impl ThresholdSigner {
 
 		// receive alice's signature share m_a, and decrypt using expected key
 		let mut ma = [0u8; SecpOrd::NBYTES];
-		try!(recv.read_exact(&mut ma));
+		recv.read_exact(&mut ma)?;
 		for ii in 0..SecpOrd::NBYTES {
 			ma[ii] ^= enckey[ii];
 		}
@@ -789,57 +1140,45 @@ impl ThresholdSigner {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use std::{thread, time};
-	use std::net::{TcpListener, TcpStream};
+	use super::channelstream::*;
+	use std::thread;
 	use test::Bencher;
-
+	
 	#[test]
-	fn test_ecdsa_2psign() {
+	fn test_mpecdsa_2psign() {
 		let msg = "The Quick Brown Fox Jumped Over The Lazy Dog".as_bytes();
 		let mut rng = rand::thread_rng();
 		let ska = SecpOrd::rand(&mut rng);
 		let skb = SecpOrd::rand(&mut rng);
-
+		
+		let (mut writ_a, mut read_b) = channelstream::new_channelstream();
+		let (mut writ_b, mut read_a) = channelstream::new_channelstream();
+		
 		let thandle = thread::spawn(move || {
-			let listener = match TcpListener::bind("127.0.0.1:12347") {
-				Ok(l) => l,
-				Err(e) => panic!("Bob err: {:?}",e),
-			};
-			let (mut streamrecv, _) = listener.accept().unwrap();
-			let mut streamsend = streamrecv.try_clone().unwrap();
+			
 			let mut rng = rand::thread_rng();
-			let bob = Bob2P::new(&skb,&mut rng, &mut streamrecv, &mut streamsend);
+			let bob = Bob2P::new(&skb,&mut rng, &mut read_b, &mut writ_b);
 			if bob.is_err() {
 				return Err(bob.err().unwrap());
 			}
 			let bob = bob.unwrap();
-			
-
+            
 			let mut results = Vec::with_capacity(10);
 			for _ in 0..10 {
-				results.push(bob.sign(&msg, &mut rng, &mut streamrecv, &mut streamsend));
+				results.push(bob.sign(&msg, &mut rng, &mut read_b, &mut writ_b));
 			}
-
+            
 			Ok(results)
 		});
-
-		// wait a little time for the listener to start
-		thread::sleep(time::Duration::from_millis(50)); 
-
-		let mut streamsend = match TcpStream::connect("127.0.0.1:12347") {
-			Ok(l) => l,
-			Err(e) => panic!("Alice err: {:?}", e),
-		};
-		let mut streamrecv = streamsend.try_clone().unwrap();
-
-		let alice = Alice2P::new(&ska, &mut rng, &mut streamrecv, &mut streamsend);
+        
+		let alice = Alice2P::new(&ska, &mut rng, &mut read_a, &mut writ_a);
 		assert!(alice.is_ok());
 		let alice = alice.unwrap();
 		let mut aliceresults = Vec::with_capacity(10);
 		for _ in 0..10 {
-			aliceresults.push(alice.sign(&msg, &mut rng, &mut streamrecv, &mut streamsend));
+			aliceresults.push(alice.sign(&msg, &mut rng, &mut read_a, &mut writ_a));
 		}
-
+        
 		let bobresults = thandle.join().unwrap();
 		assert!(bobresults.is_ok());
 		let bobresults = bobresults.unwrap();
@@ -850,151 +1189,69 @@ mod tests {
 	}
 
 	#[test]
-	fn test_ecdsa_3p2tsetup() {
-		let mut rng = rand::thread_rng();
-		let ska = SecpOrd::rand(&mut rng);
-		let skb = SecpOrd::rand(&mut rng);
-		let skc = SecpOrd::rand(&mut rng);
-
-		let pk = Secp::gen().scalar_table(&ska.add(&skb).add(&skc));
-
-		let thandlec = thread::spawn(move || {
-			let alicelistener = match TcpListener::bind("127.0.0.1:12456") {
-				Ok(l) => l,
-				Err(e) => panic!("Charlie err: {:?}",e),
-			};
-			let (mut alicerecv, _) = alicelistener.accept().unwrap();
-			let mut alicesend = alicerecv.try_clone().unwrap();
-			let boblistener = match TcpListener::bind("127.0.0.1:12457") {
-				Ok(l) => l,
-				Err(e) => panic!("Charlie err: {:?}",e),
-			};
-			let (mut bobrecv, _) = boblistener.accept().unwrap();
-			let mut bobsend = bobrecv.try_clone().unwrap();
-			let mut rng = rand::thread_rng();
-			let charlie = ThresholdSigner::new(2, 2, &skc, &mut rng, &mut [Some(&mut alicerecv),Some(&mut bobrecv),None], &mut [Some(&mut alicesend),Some(&mut bobsend),None]);
-			charlie
-		});
-
-		// wait a little time for the listener to start
-		thread::sleep(time::Duration::from_millis(100)); 
-
-		let thandleb = thread::spawn(move || {
-			let alicelistener = match TcpListener::bind("127.0.0.1:12458") {
-				Ok(l) => l,
-				Err(e) => panic!("Bob err: {:?}",e),
-			};
-			let (mut alicerecv, _) = alicelistener.accept().unwrap();
-			let mut alicesend = alicerecv.try_clone().unwrap();
-			let mut charliesend = match TcpStream::connect("127.0.0.1:12457") {
-				Ok(l) => l,
-				Err(e) => panic!("Bob err: {:?}", e),
-			};
-			let mut charlierecv = charliesend.try_clone().unwrap();
-			let mut rng = rand::thread_rng();
-			let bob = ThresholdSigner::new(1, 2, &skb, &mut rng, &mut [Some(&mut alicerecv),None,Some(&mut charlierecv)], &mut [Some(&mut alicesend),None,Some(&mut charliesend)]);
-			bob
-		});
-
-		// wait a little time for the listener to start
-		thread::sleep(time::Duration::from_millis(100)); 
-
-		let thandlea = thread::spawn(move || {
-			let mut charliesend = match TcpStream::connect("127.0.0.1:12456") {
-				Ok(l) => l,
-				Err(e) => panic!("Alice err: {:?}", e),
-			};
-			let mut charlierecv = charliesend.try_clone().unwrap();
-
-			let mut bobsend = match TcpStream::connect("127.0.0.1:12458") {
-				Ok(l) => l,
-				Err(e) => panic!("Alice err: {:?}", e),
-			};
-			let mut bobrecv = bobsend.try_clone().unwrap();
-			let mut rng = rand::thread_rng();
-			let alice = ThresholdSigner::new(0, 2, &ska, &mut rng, &mut [None,Some(&mut bobrecv),Some(&mut charlierecv)], &mut [None,Some(&mut bobsend),Some(&mut charliesend)]);
-			alice
-		});
-
-		let alice = thandlea.join().unwrap();
-		assert!(alice.is_ok());
-		let bob = thandleb.join().unwrap();
-		assert!(bob.is_ok());
-		let charlie = thandlec.join().unwrap();
-		assert!(charlie.is_ok());
-		assert_eq!(alice.unwrap().pk, pk);
-		assert_eq!(bob.unwrap().pk, pk);
-		assert_eq!(charlie.unwrap().pk, pk);
+	fn test_mpecdsa_3p2tsetup() {
+		let threshold = 2;
+		let parties = 3;
+		
+		let (sendvec, recvvec) = spawn_n2_channelstreams(parties);
+		
+		let thandles = sendvec.into_iter().zip(recvvec.into_iter()).enumerate().map(|(ii, (si, ri))| {
+			thread::spawn(move || {
+				let mut rng = rand::thread_rng();
+				let mut sin = si;
+				let mut rin = ri;
+				ThresholdSigner::new(ii, threshold, &mut rng, &mut rin, &mut sin)
+			})
+		}).collect::<Vec<_>>();
+ 
+		let mut firstpk = Secp::INF;
+		for handle in thandles {
+			let signer = handle.join().unwrap();
+			//signer.is_ok();
+			assert!(signer.is_ok());
+			if firstpk == Secp::INF {
+				firstpk = signer.unwrap().pk;
+			} else {
+				assert_eq!(signer.unwrap().pk, firstpk);
+			}
+		}
 	}
 
 	#[test]
-	fn test_ecdsa_3p2tsign() {
-		let mut rng = rand::thread_rng();
-		let ska = SecpOrd::rand(&mut rng);
-		let skb = SecpOrd::rand(&mut rng);
-		let skc = SecpOrd::rand(&mut rng);
+	fn test_mpecdsa_3p2tsign() {
 
-		let thandlec = thread::spawn(move || {
-			let alicelistener = match TcpListener::bind("127.0.0.1:12756") {
-				Ok(l) => l,
-				Err(e) => panic!("Charlie err: {:?}",e),
-			};
-			let (mut alicerecv, _) = alicelistener.accept().unwrap();
-			let mut alicesend = alicerecv.try_clone().unwrap();
-			let boblistener = match TcpListener::bind("127.0.0.1:12757") {
-				Ok(l) => l,
-				Err(e) => panic!("Charlie err: {:?}",e),
-			};
-			let (mut bobrecv, _) = boblistener.accept().unwrap();
-			let mut bobsend = bobrecv.try_clone().unwrap();
-			let mut rng = rand::thread_rng();
-			let charlie = ThresholdSigner::new(2, 2, &skc, &mut rng, &mut [Some(&mut alicerecv),Some(&mut bobrecv),None], &mut [Some(&mut alicesend),Some(&mut bobsend),None]).unwrap();
-			let result1 = charlie.sign(&[0], &"etaoin shrdlu".as_bytes(), &mut rng, &mut alicerecv, &mut alicesend);
-			let result2 = charlie.sign(&[1], &"Lorem ipsum dolor sit amet".as_bytes(), &mut rng, &mut bobrecv, &mut bobsend);
-			(result1, result2)
-		});
+		let (mut sendvec, mut recvvec) = spawn_n2_channelstreams(3);
 
-		// wait a little time for the listener to start
-		thread::sleep(time::Duration::from_millis(100)); 
-
-		let thandleb = thread::spawn(move || {
-			let alicelistener = match TcpListener::bind("127.0.0.1:12758") {
-				Ok(l) => l,
-				Err(e) => panic!("Bob err: {:?}",e),
-			};
-			let (mut alicerecv, _) = alicelistener.accept().unwrap();
-			let mut alicesend = alicerecv.try_clone().unwrap();
-			let mut charliesend = match TcpStream::connect("127.0.0.1:12757") {
-				Ok(l) => l,
-				Err(e) => panic!("Bob err: {:?}", e),
-			};
-			let mut charlierecv = charliesend.try_clone().unwrap();
-			let mut rng = rand::thread_rng();
-			let bob = ThresholdSigner::new(1, 2, &skb, &mut rng, &mut [Some(&mut alicerecv),None,Some(&mut charlierecv)], &mut [Some(&mut alicesend),None,Some(&mut charliesend)]).unwrap();
-			let result1 = bob.sign(&[0], &"The Quick Brown Fox Jumped Over The Lazy Dog".as_bytes(), &mut rng, &mut alicerecv, &mut alicesend);
-			let result2 = bob.sign(&[2], &"Lorem ipsum dolor sit amet".as_bytes(), &mut rng, &mut charlierecv, &mut charliesend);
-			(result1, result2)
-		});
-
-		// wait a little time for the listener to start
-		thread::sleep(time::Duration::from_millis(100)); 
+		let mut s0 = sendvec.remove(0);
+		let mut r0 = recvvec.remove(0);
 
 		let thandlea = thread::spawn(move || {
-			let mut charliesend = match TcpStream::connect("127.0.0.1:12756") {
-				Ok(l) => l,
-				Err(e) => panic!("Alice err: {:?}", e),
-			};
-			let mut charlierecv = charliesend.try_clone().unwrap();
-
-			let mut bobsend = match TcpStream::connect("127.0.0.1:12758") {
-				Ok(l) => l,
-				Err(e) => panic!("Alice err: {:?}", e),
-			};
-			let mut bobrecv = bobsend.try_clone().unwrap();
 			let mut rng = rand::thread_rng();
-			let alice = ThresholdSigner::new(0, 2, &ska, &mut rng, &mut [None,Some(&mut bobrecv),Some(&mut charlierecv)], &mut [None,Some(&mut bobsend),Some(&mut charliesend)]).unwrap();
-			let result1 = alice.sign(&[1], &"The Quick Brown Fox Jumped Over The Lazy Dog".as_bytes(), &mut rng, &mut bobrecv, &mut bobsend);
-			let result2 = alice.sign(&[2], &"etaoin shrdlu".as_bytes(), &mut rng, &mut charlierecv, &mut charliesend);
+			let mut alice = ThresholdSigner::new(0, 2, &mut rng, &mut r0[..], &mut s0[..]).unwrap();
+			let result1 = alice.sign(&[1], &"The Quick Brown Fox Jumped Over The Lazy Dog".as_bytes(), &mut rng, &mut r0[..], &mut s0[..]);
+			let result2 = alice.sign(&[2], &"etaoin shrdlu".as_bytes(), &mut rng, &mut r0[..], &mut s0[..]);
+			(result1, result2)
+		});
+
+		let mut s1 = sendvec.remove(0);
+		let mut r1 = recvvec.remove(0);
+
+		let thandleb = thread::spawn(move || {
+			let mut rng = rand::thread_rng();
+			let mut bob = ThresholdSigner::new(1, 2, &mut rng, &mut r1[..], &mut s1[..]).unwrap();
+			let result1 = bob.sign(&[0], &"The Quick Brown Fox Jumped Over The Lazy Dog".as_bytes(), &mut rng, &mut r1[..], &mut s1[..]);
+			let result2 = bob.sign(&[2], &"Lorem ipsum dolor sit amet".as_bytes(), &mut rng, &mut r1[..], &mut s1[..]);
+			(result1, result2)
+		});
+
+		let mut s2 = sendvec.remove(0);
+		let mut r2 = recvvec.remove(0);
+		
+		let thandlec = thread::spawn(move || {
+			let mut rng = rand::thread_rng();
+			let mut charlie = ThresholdSigner::new(2, 2, &mut rng, &mut r2[..], &mut s2[..]).unwrap();
+			let result1 = charlie.sign(&[0], &"etaoin shrdlu".as_bytes(), &mut rng, &mut r2[..], &mut s2[..]);
+			let result2 = charlie.sign(&[1], &"Lorem ipsum dolor sit amet".as_bytes(), &mut rng, &mut r2[..], &mut s2[..]);
 			(result1, result2)
 		});
 
@@ -1010,54 +1267,137 @@ mod tests {
 	}
 
 	#[test]
-	fn test_ecdsa_7p4tsetup() {
-		let mut rng = rand::thread_rng();
+	fn test_mpecdsa_3p3tsign() {
+
+		let (mut sendvec, mut recvvec) = spawn_n2_channelstreams(3);
+
+		let mut s0 = sendvec.remove(0);
+		let mut r0 = recvvec.remove(0);
+
+		let thandlea = thread::spawn(move || {
+			let mut rng = rand::thread_rng();
+			let mut alice = ThresholdSigner::new(0, 3, &mut rng, &mut r0[..], &mut s0[..]).unwrap();
+			let result1 = alice.sign(&[1,2], &"etaoin shrdlu".as_bytes(), &mut rng, &mut r0[..], &mut s0[..]);
+			result1
+		});
+
+		let mut s1 = sendvec.remove(0);
+		let mut r1 = recvvec.remove(0);
+
+		let thandleb = thread::spawn(move || {
+			let mut rng = rand::thread_rng();
+			let mut bob = ThresholdSigner::new(1, 3, &mut rng, &mut r1[..], &mut s1[..]).unwrap();
+			let result1 = bob.sign(&[0,2], &"etaoin shrdlu".as_bytes(), &mut rng, &mut r1[..], &mut s1[..]);
+			result1
+		});
+
+		let mut s2 = sendvec.remove(0);
+		let mut r2 = recvvec.remove(0);
+
+		let thandlec = thread::spawn(move || {
+			let mut rng = rand::thread_rng();
+			let mut charlie = ThresholdSigner::new(2, 3, &mut rng, &mut r2[..], &mut s2[..]).unwrap();
+			let result1 = charlie.sign(&[0, 1], &"etaoin shrdlu".as_bytes(), &mut rng, &mut r2[..], &mut s2[..]);
+			result1
+		});
+
+		let alice = thandlea.join().unwrap();
+		assert!(alice.is_ok());
+		let bob = thandleb.join().unwrap();
+		assert!(bob.is_ok());
+		let charlie = thandlec.join().unwrap();
+		assert!(charlie.is_ok());
+	}
+
+	#[test]
+	fn test_mpecdsa_7p4tsetup() {
 		let threshold = 4;
 		let parties = 7;
-		let mut skvec: Vec<SecpOrd> = Vec::with_capacity(parties);
-		let mut sksum = SecpOrd::ZERO;
-		for ii in 0..parties {
-			skvec.push(SecpOrd::rand(&mut rng));
-			sksum = sksum.add(&skvec[ii]);
-		}
-		let pk = Secp::scalar_gen(&sksum).affine();
-
-		let mut thandles = Vec::with_capacity(parties);
-		for ii in (0..parties).rev() {
-			thread::sleep(time::Duration::from_millis(100)); 
-			let ski = skvec[ii].clone();
-			thandles.push(thread::spawn(move || {
-				let mut sendvec: Vec<Option<std::net::TcpStream>> = Vec::with_capacity(parties);
-				let mut recvvec: Vec<Option<std::net::TcpStream>> = Vec::with_capacity(parties);
-				for jj in (0..parties).rev() {
-					if jj < ii {
-						let listener = TcpListener::bind(format!("127.0.0.1:4{:02}{:02}", ii, jj)).unwrap();
-						let (mut recv, _) = listener.accept().unwrap();
-						let mut send = recv.try_clone().unwrap();
-						sendvec.push(Some(send));
-						recvvec.push(Some(recv));
-					} else if jj > ii {
-						let mut send = TcpStream::connect(format!("127.0.0.1:4{:02}{:02}", jj, ii)).unwrap();
-						let mut recv = send.try_clone().unwrap();
-						sendvec.push(Some(send));
-						recvvec.push(Some(recv));
-					} else {
-						sendvec.push(None);
-						recvvec.push(None);
-					}
-				}
+		
+		let (sendvec, recvvec) = spawn_n2_channelstreams(parties);
+		
+		let thandles = sendvec.into_iter().zip(recvvec.into_iter()).enumerate().map(|(ii, (si, ri))| {
+			thread::spawn(move || {
 				let mut rng = rand::thread_rng();
-				sendvec.reverse();
-				recvvec.reverse();
-				ThresholdSigner::new(ii, threshold, &ski, &mut rng, sendvec.as_mut_slice(), recvvec.as_mut_slice())
-			}));
+				let mut sin = si;
+				let mut rin = ri;
+				ThresholdSigner::new(ii, threshold, &mut rng, &mut rin, &mut sin)
+			})
+		}).collect::<Vec<_>>();
+ 
+		let mut firstpk = Secp::INF;
+		for handle in thandles {
+			let signer = handle.join().unwrap();
+			//signer.is_ok();
+			assert!(signer.is_ok());
+			if firstpk == Secp::INF {
+				firstpk = signer.unwrap().pk;
+			} else {
+				assert_eq!(signer.unwrap().pk, firstpk);
+			}
 		}
+	}
 
+	#[test]
+	fn test_mpecdsa_7p3tsetup() {
+		let threshold = 3;
+		let parties = 7;
+		
+		let (sendvec, recvvec) = spawn_n2_channelstreams(parties);
+		
+		let thandles = sendvec.into_iter().zip(recvvec.into_iter()).enumerate().map(|(ii, (si, ri))| {
+			thread::spawn(move || {
+				let mut rng = rand::thread_rng();
+				let mut sin = si;
+				let mut rin = ri;
+				ThresholdSigner::new(ii, threshold, &mut rng, &mut rin, &mut sin)
+			})
+		}).collect::<Vec<_>>();
+ 
+		let mut firstpk = Secp::INF;
 		for handle in thandles {
 			let signer = handle.join().unwrap();
 			assert!(signer.is_ok());
-			assert_eq!(signer.unwrap().pk, pk);
+			if firstpk == Secp::INF {
+				firstpk = signer.unwrap().pk;
+			} else {
+				assert_eq!(signer.unwrap().pk, firstpk);
+			}
 		}
+	}
+
+	#[test]
+	fn test_mpecdsa_7p5tsign() {
+		let threshold = 5;
+		let parties : usize = 7;
+
+		let (sendvec, recvvec) = spawn_n2_channelstreams(parties);
+		let thandles = sendvec.into_iter().zip(recvvec.into_iter()).enumerate().map(|(ii, (si, ri))| {
+			thread::spawn(move || {
+				let mut rng = rand::thread_rng();
+				let mut sin = si;
+				let mut rin = ri;
+				let mut signer = ThresholdSigner::new(ii, threshold, &mut rng, &mut rin[..], &mut sin[..])?;
+				if ii < threshold {
+					signer.sign(&(0usize..ii).chain((ii+1)..threshold).collect::<Vec<usize>>(), &"etaoin shrdlu".as_bytes(), &mut rng, &mut rin[..], &mut sin[..])
+				} else {
+					Ok(None)
+				}
+			})
+		}).collect::<Vec<_>>();
+
+		let mut somecount = 0;
+		for handle in thandles {
+			let result = handle.join().unwrap();
+			assert!(result.is_ok());
+			if result.is_ok() {
+				let res2 = result.unwrap();
+				if res2.is_some() {
+					somecount += 1;
+				}
+			}
+		}
+		assert_eq!(somecount, threshold);
 	}
 
 	#[bench]
@@ -1067,41 +1407,37 @@ mod tests {
 		let ska = SecpOrd::rand(&mut rng);
 		let skb = SecpOrd::rand(&mut rng);
 
+		let (mut sendvec, mut recvvec) = spawn_n2_channelstreams(2);
+
+		let mut s1 = sendvec.remove(0);
+		let mut r1 = recvvec.remove(0);
+
+		let mut s2 = sendvec.remove(0);
+		let mut r2 = recvvec.remove(0);
+
 		let thandle = thread::spawn(move || {
-			let listener = TcpListener::bind("127.0.0.1:12348").expect("Bob failed to bind");
-			let (mut streamrecv, _) = listener.accept().expect("Bob failed to listen");
-			let mut streamsend = streamrecv.try_clone().expect("Bob failed to clone stream");
-			streamsend.set_nodelay(true).expect("Bob failed to set nodelay");
-			streamrecv.set_nodelay(true).expect("Bob failed to set nodelay");
+
 
 			let mut rng = rand::thread_rng();
-			let bob = Bob2P::new(&skb,&mut rng, &mut streamrecv, &mut streamsend).expect("Failed to instantiate Bob");
+			let bob = Bob2P::new(&skb,&mut rng, &mut r1[1].as_mut().unwrap(), &mut s1[1].as_mut().unwrap()).expect("Failed to instantiate Bob");
 			
 			let mut keepgoing = [1u8; 1];
 
-			streamrecv.read_exact(&mut keepgoing).expect("Bob failed to read (1)");
+			r1[1].as_mut().unwrap().read_exact(&mut keepgoing).expect("Bob failed to read (1)");
 			while keepgoing[0] > 0 {
-				bob.sign(&msg, &mut rng, &mut streamrecv, &mut streamsend).expect("Bob failed to sign");
-				streamrecv.read_exact(&mut keepgoing).expect("Bob failed to read (2)");
+				bob.sign(&msg, &mut rng, &mut r1[1].as_mut().unwrap(), &mut s1[1].as_mut().unwrap()).expect("Bob failed to sign");
+				r1[1].as_mut().unwrap().read_exact(&mut keepgoing).expect("Bob failed to read (2)");
 			}
 		});
 
-		// wait a little time for the listener to start
-		thread::sleep(time::Duration::from_millis(100)); 
-
-		let mut streamsend = TcpStream::connect("127.0.0.1:12348").expect("Alice failed to connect");
-		let mut streamrecv = streamsend.try_clone().expect("Alice failed to clone stream");
-		streamsend.set_nodelay(true).expect("Alice failed to set nodelay");
-		streamrecv.set_nodelay(true).expect("Alice failed to set nodelay");
-
-		let alice = Alice2P::new(&ska,&mut rng, &mut streamrecv, &mut streamsend).expect("Failed to instantiate Alice");
+		let alice = Alice2P::new(&ska,&mut rng, &mut r2[0].as_mut().unwrap(), &mut s2[0].as_mut().unwrap()).expect("Failed to instantiate Alice");
 		b.iter(|| { 
-			streamsend.write(&[1]).expect("Alice failed to write (1)");
-			streamsend.flush().expect("Alice failed to flush");
-			alice.sign(&msg, &mut rng, &mut streamrecv, &mut streamsend).expect("Bob failed to sign");
+			s2[0].as_mut().unwrap().write(&[1]).expect("Alice failed to write (1)");
+			s2[0].as_mut().unwrap().flush().expect("Alice failed to flush");
+			alice.sign(&msg, &mut rng, &mut r2[0].as_mut().unwrap(), &mut s2[0].as_mut().unwrap()).expect("Bob failed to sign");
 		});
-		streamsend.write(&[0]).expect("Alice failed to write (2)");
-		streamsend.flush().expect("Alice failed to flush");
+		s2[0].as_mut().unwrap().write(&[0]).expect("Alice failed to write (2)");
+		s2[0].as_mut().unwrap().flush().expect("Alice failed to flush");
 
 		thandle.join().unwrap();
 	}
@@ -1111,73 +1447,38 @@ mod tests {
 		let mut rng = rand::thread_rng();
 		let threshold = 2;
 		let parties = 3;
-		let mut skvec: Vec<SecpOrd> = Vec::with_capacity(parties);
-		for _ in 0..parties {
-			skvec.push(SecpOrd::rand(&mut rng));
-		}
 
-		let mut thandles = Vec::with_capacity(parties);
-		for ii in (1..parties).rev() {
-			thread::sleep(time::Duration::from_millis(100)); 
-			let ski = skvec[ii].clone();
-			thandles.push(thread::spawn(move || {
-				let mut sendvec: Vec<Option<std::net::TcpStream>> = Vec::with_capacity(parties);
-				let mut recvvec: Vec<Option<std::net::TcpStream>> = Vec::with_capacity(parties);
-				for jj in (0..parties).rev() {
-					if jj < ii {
-						let listener = TcpListener::bind(format!("127.0.0.1:3{:02}{:02}", ii, jj)).unwrap();
-						let (mut recv, _) = listener.accept().unwrap();
-						let mut send = recv.try_clone().unwrap();
-						sendvec.push(Some(send));
-						recvvec.push(Some(recv));
-					} else if jj > ii {
-						let mut send = TcpStream::connect(format!("127.0.0.1:3{:02}{:02}", jj, ii)).unwrap();
-						let mut recv = send.try_clone().unwrap();
-						sendvec.push(Some(send));
-						recvvec.push(Some(recv));
-					} else {
-						sendvec.push(None);
-						recvvec.push(None);
-					}
-				}
+		let (mut sendvec, mut recvvec) = spawn_n2_channelstreams(parties);
+
+		let mut s0 = sendvec.remove(0);
+		let mut r0 = recvvec.remove(0);
+
+		let thandles = sendvec.into_iter().zip(recvvec.into_iter()).enumerate().map(|(iiminusone, (si, ri))| {			
+			thread::spawn(move || {
+				let ii = iiminusone + 1;
+				let mut sin = si;
+				let mut rin = ri;
 				let mut rng = rand::thread_rng();
-				sendvec.reverse();
-				recvvec.reverse();
 
 				let mut keepgoing = [1u8; 1];
-				recvvec[0].as_mut().unwrap().read_exact(&mut keepgoing).expect(&format!("Party {} failed to read (1)", ii));
+				rin[0].as_mut().unwrap().read_exact(&mut keepgoing).expect(&format!("Party {} failed to read (1)", ii));
 				while keepgoing[0] > 0 {
-					ThresholdSigner::new(ii, threshold, &ski, &mut rng, sendvec.as_mut_slice(), recvvec.as_mut_slice()).expect(&format!("Party {} failed to setup", ii));
-					recvvec[0].as_mut().unwrap().read_exact(&mut keepgoing).expect(&format!("Party {} failed to read (2)", ii));
+					ThresholdSigner::new(ii, threshold, &mut rng, &mut rin[..], &mut sin[..]).expect(&format!("Party {} failed to setup", ii));
+					rin[0].as_mut().unwrap().read_exact(&mut keepgoing).expect(&format!("Party {} failed to read (2)", ii));
 				}
-			}));
-		}
+			})
+		}).collect::<Vec<_>>();
 
-		thread::sleep(time::Duration::from_millis(100)); 
-
-		let ski = skvec[0].clone();
-		let mut sendvec: Vec<Option<std::net::TcpStream>> = Vec::with_capacity(parties);
-		let mut recvvec: Vec<Option<std::net::TcpStream>> = Vec::with_capacity(parties);
-		for jj in (1..parties).rev() {
-			let mut send = TcpStream::connect(format!("127.0.0.1:3{:02}00", jj)).unwrap();
-			let mut recv = send.try_clone().unwrap();
-			sendvec.push(Some(send));
-			recvvec.push(Some(recv));
-		}
-		sendvec.push(None);
-		recvvec.push(None);
-		sendvec.reverse();
-		recvvec.reverse();
 		b.iter(|| { 
 			for ii in 1..parties {
-				sendvec[ii].as_mut().unwrap().write(&[1]).expect("Party 0 failed to write (1)");
-				sendvec[ii].as_mut().unwrap().flush().expect("Party 0 failed to flush");
+				s0[ii].as_mut().unwrap().write(&[1]).expect("Party 0 failed to write (1)");
+				s0[ii].as_mut().unwrap().flush().expect("Party 0 failed to flush");
 			}
-			ThresholdSigner::new(0, threshold, &ski, &mut rng, sendvec.as_mut_slice(), recvvec.as_mut_slice()).expect("Party 0 failed to setup");
+			ThresholdSigner::new(0, threshold, &mut rng, &mut r0[..], &mut s0[..]).expect("Party 0 failed to setup");
 		});
 		for ii in 1..parties {
-			sendvec[ii].as_mut().unwrap().write(&[0]).expect("Party 0 failed to write (2)");
-			sendvec[ii].as_mut().unwrap().flush().expect("Party 0 failed to flush");
+			s0[ii].as_mut().unwrap().write(&[0]).expect("Party 0 failed to write (2)");
+			s0[ii].as_mut().unwrap().flush().expect("Party 0 failed to flush");
 		}
 		for handle in thandles {
 			handle.join().unwrap();
@@ -1187,79 +1488,171 @@ mod tests {
 	#[bench]
 	fn bench_ecdsa_3p2tsign(b: &mut Bencher) -> () {
 		let msg = "The Quick Brown Fox Jumped Over The Lazy Dog".as_bytes();
-		let mut rng = rand::thread_rng();
-		let ska = SecpOrd::rand(&mut rng);
-		let skb = SecpOrd::rand(&mut rng);
-		let skc = SecpOrd::rand(&mut rng);
+		
+		let (mut sendvec, mut recvvec) = spawn_n2_channelstreams(3);
+		let mut s0 = sendvec.remove(0);
+		let mut r0 = recvvec.remove(0);
+		let mut s1 = sendvec.remove(0);
+		let mut r1 = recvvec.remove(0);
+		let mut s2 = sendvec.remove(0);
+		let mut r2 = recvvec.remove(0);
 
 		let thandlec = thread::spawn(move || {
-			let alicelistener = match TcpListener::bind("127.0.0.1:12856") {
-				Ok(l) => l,
-				Err(e) => panic!("Charlie err: {:?}",e),
-			};
-			let (mut alicerecv, _) = alicelistener.accept().unwrap();
-			let mut alicesend = alicerecv.try_clone().unwrap();
-			let boblistener = match TcpListener::bind("127.0.0.1:12857") {
-				Ok(l) => l,
-				Err(e) => panic!("Charlie err: {:?}",e),
-			};
-			let (mut bobrecv, _) = boblistener.accept().unwrap();
-			let mut bobsend = bobrecv.try_clone().unwrap();
 			let mut rng = rand::thread_rng();
-			let charlie = ThresholdSigner::new(2, 2, &skc, &mut rng, &mut [Some(&mut alicerecv),Some(&mut bobrecv),None], &mut [Some(&mut alicesend),Some(&mut bobsend),None]).unwrap();
-			charlie.sign(&[0], &"etaoin shrdlu".as_bytes(), &mut rng, &mut alicerecv, &mut alicesend).unwrap();
+			let mut charlie = ThresholdSigner::new(2, 2, &mut rng, &mut r2[..], &mut s2[..]).unwrap();
+			charlie.sign(&[0], &"etaoin shrdlu".as_bytes(), &mut rng, &mut r2[..], &mut s2[..]).unwrap();
 		});
 
-		// wait a little time for the listener to start
-		thread::sleep(time::Duration::from_millis(100)); 
-
 		let thandleb = thread::spawn(move || {
-			let alicelistener = match TcpListener::bind("127.0.0.1:12858") {
-				Ok(l) => l,
-				Err(e) => panic!("Bob err: {:?}",e),
-			};
-			let (mut alicerecv, _) = alicelistener.accept().unwrap();
-			let mut alicesend = alicerecv.try_clone().unwrap();
-			let mut charliesend = match TcpStream::connect("127.0.0.1:12857") {
-				Ok(l) => l,
-				Err(e) => panic!("Bob err: {:?}", e),
-			};
-			let mut charlierecv = charliesend.try_clone().unwrap();
 			let mut rng = rand::thread_rng();
-			let bob = ThresholdSigner::new(1, 2, &skb, &mut rng, &mut [Some(&mut alicerecv),None,Some(&mut charlierecv)], &mut [Some(&mut alicesend),None,Some(&mut charliesend)]).unwrap();
+			let mut bob = ThresholdSigner::new(1, 2, &mut rng, &mut r1[..], &mut s1[..]).unwrap();
 			let mut keepgoing = [1u8; 1];
-			alicerecv.read_exact(&mut keepgoing).expect("Bob failed to read (1)");
+			r1[0].as_mut().unwrap().read_exact(&mut keepgoing).expect("Bob failed to read (1)");
 			while keepgoing[0] > 0 {
-				bob.sign(&[0], &msg, &mut rng, &mut alicerecv, &mut alicesend).expect("Bob failed to sign");
-				alicerecv.read_exact(&mut keepgoing).expect("Bob failed to read (2)");
+				bob.sign(&[0], &msg, &mut rng,  &mut r1[..], &mut s1[..]).expect("Bob failed to sign");
+				r1[0].as_mut().unwrap().read_exact(&mut keepgoing).expect("Bob failed to read (2)");
 			}
 		});
 
-		// wait a little time for the listener to start
-		thread::sleep(time::Duration::from_millis(100)); 
+		let mut rng = rand::thread_rng();
 
-		let mut charliesend = match TcpStream::connect("127.0.0.1:12856") {
-			Ok(l) => l,
-			Err(e) => panic!("Alice err: {:?}", e),
-		};
-		let mut charlierecv = charliesend.try_clone().unwrap();
-
-		let mut bobsend = match TcpStream::connect("127.0.0.1:12858") {
-			Ok(l) => l,
-			Err(e) => panic!("Alice err: {:?}", e),
-		};
-		let mut bobrecv = bobsend.try_clone().unwrap();
-		let alice = ThresholdSigner::new(0, 2, &ska, &mut rng, &mut [None,Some(&mut bobrecv),Some(&mut charlierecv)], &mut [None,Some(&mut bobsend),Some(&mut charliesend)]).unwrap();
-		alice.sign(&[2], &"etaoin shrdlu".as_bytes(), &mut rng, &mut charlierecv, &mut charliesend).unwrap();
+		let mut alice = ThresholdSigner::new(0, 2, &mut rng, &mut r0[..], &mut s0[..]).unwrap();
+		alice.sign(&[2], &"etaoin shrdlu".as_bytes(), &mut rng, &mut r0[..], &mut s0[..]).unwrap();
 		thandlec.join().unwrap();
 			
 		b.iter(|| { 
-			bobsend.write(&[1]).expect("Alice failed to write (1)");
-			bobsend.flush().expect("Alice failed to flush");
-			alice.sign(&[1], &msg, &mut rng, &mut bobrecv, &mut bobsend).expect("Alice failed to sign");
+			s0[1].as_mut().unwrap().write(&[1]).expect("Alice failed to write (1)");
+			s0[1].as_mut().unwrap().flush().expect("Alice failed to flush");
+			alice.sign(&[1], &msg, &mut rng, &mut r0[..], &mut s0[..]).expect("Alice failed to sign");
 		});
-		bobsend.write(&[0]).expect("Alice failed to write (2)");
-		bobsend.flush().expect("Alice failed to flush");
+		s0[1].as_mut().unwrap().write(&[0]).expect("Alice failed to write (2)");
+		s0[1].as_mut().unwrap().flush().expect("Alice failed to flush");
 		thandleb.join().unwrap();
+	}
+
+	#[bench]
+	fn bench_ecdsa_3p3tsign(b: &mut Bencher) {
+		let parties = 3;
+		let threshold = 3;
+
+		let (mut sendvec, mut recvvec) = spawn_n2_channelstreams(parties);
+
+		let mut s0 = sendvec.remove(0);
+		let mut r0 = recvvec.remove(0);
+
+		let thandles = sendvec.into_iter().zip(recvvec.into_iter()).enumerate().map(|(iiminusone, (si, ri))| {			
+			thread::spawn(move || {
+				let ii = iiminusone + 1;
+				let mut sin = si;
+				let mut rin = ri;
+				let mut rng = rand::thread_rng();
+				let mut rngs = Vec::with_capacity(parties);
+				for _ in 0..parties {
+					let mut newrng = rand::ChaChaRng::new_unseeded();
+					newrng.set_counter(rng.next_u64(), rng.next_u64());
+					rngs.push(newrng);
+				}
+				
+				let mut signer = ThresholdSigner::new(ii, threshold, &mut rng, &mut rin[..], &mut sin[..]).unwrap();
+
+				let mut keepgoing = [1u8; 1];
+				rin[0].as_mut().unwrap().read_exact(&mut keepgoing).expect(&format!("Party {} failed to read (1)", ii));
+				while keepgoing[0] > 0 {
+					if ii < threshold {
+						signer.sign(&(0usize..ii).chain((ii+1)..threshold).collect::<Vec<usize>>(), &"etaoin shrdlu".as_bytes(), &mut rng, &mut rin[..], &mut sin[..]).unwrap();
+					}
+					rin[0].as_mut().unwrap().read_exact(&mut keepgoing).expect(&format!("Party {} failed to read (2)", ii));
+				}
+			})
+		}).collect::<Vec<_>>();
+
+		let mut rng = rand::thread_rng();
+		let mut rngs = Vec::with_capacity(parties);
+		for _ in 0..parties {
+			let mut newrng = rand::ChaChaRng::new_unseeded();
+			newrng.set_counter(rng.next_u64(), rng.next_u64());
+			rngs.push(newrng);
+		}
+
+		let mut signer = ThresholdSigner::new(0, threshold, &mut rng, &mut r0[..], &mut s0[..]).unwrap();
+
+		b.iter(|| { 
+			for ii in 1..parties {
+				s0[ii].as_mut().unwrap().write(&[1]).expect("Party 0 failed to write (1)");
+				s0[ii].as_mut().unwrap().flush().expect("Party 0 failed to flush");
+			}
+			signer.sign(&(1..(threshold)).collect::<Vec<usize>>(), &"etaoin shrdlu".as_bytes(), &mut rng, &mut r0[..], &mut s0[..]).unwrap();
+		});
+
+		for ii in 1..parties {
+			s0[ii].as_mut().unwrap().write(&[0]).expect("Party 0 failed to write (2)");
+			s0[ii].as_mut().unwrap().flush().expect("Party 0 failed to flush");
+		}
+		for handle in thandles {
+			handle.join().unwrap();
+		}	
+	}
+
+	#[bench]
+	fn bench_ecdsa_7p7tsign(b: &mut Bencher) {
+		let parties = 7;
+		let threshold = 7;
+
+		let (mut sendvec, mut recvvec) = spawn_n2_channelstreams(parties);
+
+		let mut s0 = sendvec.remove(0);
+		let mut r0 = recvvec.remove(0);
+
+		let thandles = sendvec.into_iter().zip(recvvec.into_iter()).enumerate().map(|(iiminusone, (si, ri))| {			
+			thread::spawn(move || {
+				let ii = iiminusone + 1;
+				let mut sin = si;
+				let mut rin = ri;
+				let mut rng = rand::thread_rng();
+				let mut rngs = Vec::with_capacity(parties);
+				for _ in 0..parties {
+					let mut newrng = rand::ChaChaRng::new_unseeded();
+					newrng.set_counter(rng.next_u64(), rng.next_u64());
+					rngs.push(newrng);
+				}
+				
+				let mut signer = ThresholdSigner::new(ii, threshold, &mut rng, &mut rin[..], &mut sin[..]).unwrap();
+
+				let mut keepgoing = [1u8; 1];
+				rin[0].as_mut().unwrap().read_exact(&mut keepgoing).expect(&format!("Party {} failed to read (1)", ii));
+				while keepgoing[0] > 0 {
+					if ii < threshold {
+						signer.sign(&(0usize..ii).chain((ii+1)..threshold).collect::<Vec<usize>>(), &"etaoin shrdlu".as_bytes(), &mut rng, &mut rin[..], &mut sin[..]).unwrap();
+					}
+					rin[0].as_mut().unwrap().read_exact(&mut keepgoing).expect(&format!("Party {} failed to read (2)", ii));
+				}
+			})
+		}).collect::<Vec<_>>();
+
+		let mut rng = rand::thread_rng();
+		let mut rngs = Vec::with_capacity(parties);
+		for _ in 0..parties {
+			let mut newrng = rand::ChaChaRng::new_unseeded();
+			newrng.set_counter(rng.next_u64(), rng.next_u64());
+			rngs.push(newrng);
+		}
+
+		let mut signer = ThresholdSigner::new(0, threshold, &mut rng, &mut r0[..], &mut s0[..]).unwrap();
+
+		b.iter(|| { 
+			for ii in 1..parties {
+				s0[ii].as_mut().unwrap().write(&[1]).expect("Party 0 failed to write (1)");
+				s0[ii].as_mut().unwrap().flush().expect("Party 0 failed to flush");
+			}
+			signer.sign(&(1..(threshold)).collect::<Vec<usize>>(), &"etaoin shrdlu".as_bytes(), &mut rng, &mut r0[..], &mut s0[..]).unwrap();
+		});
+
+		for ii in 1..parties {
+			s0[ii].as_mut().unwrap().write(&[0]).expect("Party 0 failed to write (2)");
+			s0[ii].as_mut().unwrap().flush().expect("Party 0 failed to flush");
+		}
+		for handle in thandles {
+			handle.join().unwrap();
+		}	
 	}
 }

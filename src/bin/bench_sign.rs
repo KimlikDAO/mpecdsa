@@ -1,6 +1,7 @@
 /// This program handles benchmarking for both signing and setup
-///
 
+use std::time::Duration;
+use std::thread::sleep;
 use std::net::{TcpListener, TcpStream};
 use std::{env};
 
@@ -46,7 +47,6 @@ pub fn process_options() -> Option<Matches> {
 		return Option::None;
 	}
 	 
-
 	return Option::Some(matches);
 
 }
@@ -68,14 +68,23 @@ fn main() {
                     matches.opt_str("p").unwrap_or("12345".to_owned()));
 
 	    	println!("Connecting to server {:?}...",port);
-			let mut stream1 = TcpStream::connect(port).unwrap();
+			let mut stream1 = TcpStream::connect(&port);
+            let connection_wait_time = 2*60;
+            let poll_interval = 100;
+            for _ in 0..(connection_wait_time*1000/poll_interval) {
+                if stream1.is_err() {
+                    sleep(Duration::from_millis(poll_interval));
+                    stream1 = TcpStream::connect(&port);    
+                }
+            }
+            let stream1 = stream1.unwrap();
 			let stream2 = stream1.try_clone().unwrap();
 			(stream1, stream2)
 		} else {
             let port = format!("0.0.0.0:{}",matches.opt_str("p").unwrap_or("12345".to_owned()));
 	    	println!("Waiting for client to connect on {}", port);
 			let listener = TcpListener::bind(port).unwrap_or_else(|e| {panic!(e) });
-			let (mut stream1, _) = listener.accept().unwrap_or_else(|e| {panic!(e) });
+			let (stream1, _) = listener.accept().unwrap_or_else(|e| {panic!(e) });
 			let stream2 = stream1.try_clone().unwrap();
 			(stream2, stream1)
 		};
@@ -97,7 +106,7 @@ fn main() {
 	            mpecdsa::mpecdsa::Bob2P::new(&skb, &mut rng, &mut streamrecv, &mut streamsend).unwrap();
 	        }
 	        let signend = PreciseTime::now();
-	        println!("{} ms avg", (signstart.to(signend)/iters)*1000 );
+	        println!("{:.3} ms avg", (signstart.to(signend).num_milliseconds() as f64)/(iters as f64) );
 
 		} else {
 			let bob = mpecdsa::mpecdsa::Bob2P::new(&skb, &mut rng, &mut streamrecv, &mut streamsend).unwrap();
@@ -106,7 +115,7 @@ fn main() {
                 bob.sign(&msg, &mut rng, &mut streamrecv, &mut streamsend).unwrap();
             }
             let signend = PreciseTime::now();
-            println!("{} ms avg", (signstart.to(signend)/iters)*1000 );
+            println!("{:.3} ms avg", (signstart.to(signend).num_milliseconds() as f64)/(iters as f64) );
 		}
 
 	} else {
@@ -117,7 +126,7 @@ fn main() {
 	            mpecdsa::mpecdsa::Alice2P::new(&ska, &mut rng, &mut streamrecv, &mut streamsend).unwrap();
 	        }
 	        let signend = PreciseTime::now();
-	        println!("{} ms avg", (signstart.to(signend)/iters)*1000 );
+	        println!("{:.3} ms avg", (signstart.to(signend).num_milliseconds() as f64)/(iters as f64) );
 
 		} else  {
             let alice = mpecdsa::mpecdsa::Alice2P::new(&ska, &mut rng, &mut streamrecv, &mut streamsend).unwrap();
@@ -126,7 +135,7 @@ fn main() {
                 alice.sign(&msg, &mut rng, &mut streamrecv, &mut streamsend).unwrap();
             }
             let signend = PreciseTime::now();
-            println!("{} ms avg", (signstart.to(signend)/iters)*1000 );
+            println!("{:.3} ms avg", (signstart.to(signend).num_milliseconds() as f64)/(iters as f64) );
 		}
 
 	}

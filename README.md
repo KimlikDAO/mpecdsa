@@ -1,7 +1,7 @@
 # MPECDSA
 
-This repository contains an implementation of the 2-of-n threshold ECDSA protocol described in
-_Threshold ECDSA from ECDSA assumptions_ by Jack Doerner, Yashvanth Kondi, Eysa Lee, and abhi shelat, which appeared at the IEEE Security & Privacy Conference (Oakland) 2018. A full version of this paper with complete proofs is available as [eprint 2018/499](https://eprint.iacr.org/2018/499), and the original conference version is available from the [IEEE](https://www.computer.org/csdl/proceedings/sp/2018/4353/00/435301a595-abs.html).
+This repository contains a implementations of the 2-of-n threshold ECDSA protocol described in
+[_Secure Two-party Threshold ECDSA from ECDSA assumptions_](https://eprint.iacr.org/2018/499) and the t-of-n threshold ECDSA protocol described in _Threshold ECDSA from ECDSA Assumptions_, both papers by Jack Doerner, Yashvanth Kondi, Eysa Lee, and abhi shelat.
 
 ## How to compile on Linux
 
@@ -42,6 +42,24 @@ Our protocol requires the [```openmp```](https://www.openmp.org/) compiler featu
 	```
 	
   
+### How to cross-compile for Linux on Macos
+This allows you to produce a statically-linked executable for Linux from  MacOS.
+
+```
+brew install FiloSottile/musl-cross/musl-cross
+brew install isl
+install_name_tool -change '@@HOMEBREW_PREFIX@@/opt/isl/lib/libisl.15.dylib' /usr/local/opt/isl/lib/libisl.dylib /usr/local/opt/musl-cross/libexec/libexec/gcc/x86_64-linux-musl/6.3.0/cc1
+ab2017:mpecdsa_private abhi$ install_name_tool -change '@@HOMEBREW_PREFIX@@/opt/isl/lib/libisl.15.dylib' /usr/local/opt/isl/lib/libisl.dylib /usr/local/opt/musl-cross/libexec/libexec/gcc/x86_64-linux-musl/6.3.0/cc1plus
+ab2017:mpecdsa_private abhi$ install_name_tool -change '@@HOMEBREW_PREFIX@@/opt/isl/lib/libisl.15.dylib' /usr/local/opt/isl/lib/libisl.dylib /usr/local/opt/musl-cross/libexec/libexec/gcc/x86_64-linux-musl/6.3.0/lto1
+```
+Finally, you can run
+```
+CC=/usr/local/bin/x86_64-linux-musl-gcc CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=/usr/local/bin/x86_64-linux-musl-gcc cargo build --release --target=x86_64-unknown-linux-musl
+``` 
+
+
+
+
 ## Benchmarking
 This repository includes three benchmark applications, which were used to generate the experimental results reported in the paper. They are:
 
