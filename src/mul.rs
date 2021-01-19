@@ -69,6 +69,10 @@ impl MulSender {
 		})
 	}
 
+	pub fn apply_refresh(&mut self, rand: &[u8], ro:&DyadicROTagger) -> Result<(),MPECDSAError> {
+		return self.ote.apply_refresh(rand, ro);
+	}
+
 	pub fn mul_extend<T:Read>(&self, input_count: usize, ro: &DyadicROTagger, recv:&mut T) -> Result<MulSenderData,MPECDSAError> {
 		let transposed_seed = self.ote.extend(input_count*(SecpOrd::NBITS+ENCODING_PER_ELEMENT_BITS) + ENCODING_EXTRA_BITS, ro, recv)?;
 
@@ -204,6 +208,10 @@ impl MulRecver {
 			publicrandomvec: publicrandomvec,
 			ote: ote
 		})
+	}
+
+	pub fn apply_refresh(&mut self, rand: &[u8], ro:&DyadicROTagger) -> Result<(),MPECDSAError> {
+		return self.ote.apply_refresh(rand, ro);
 	}
 
 	pub fn mul_encode_and_extend<T:Write>(&self, inputs_beta: &[SecpOrd], ro: &DyadicROTagger, rng: &mut dyn Rng, send: &mut T) -> Result<MulRecverData,MPECDSAError> {
@@ -521,6 +529,72 @@ mod tests {
 
 		let dro = ro.get_dyadic_tagger(0).unwrap();
 		let recver = MulRecver::new(&dro, &mut rng, r2[0].as_mut().unwrap(), s2[0].as_mut().unwrap()).unwrap();
+		let mut beta:Vec<SecpOrd> = Vec::with_capacity(10);
+		for _ in 0..10 {
+			beta.push(SecpOrd::rand(&mut rng));
+		}
+
+		let extensions = recver.mul_encode_and_extend(&beta, &dro, &mut rng, s2[0].as_mut().unwrap()).unwrap();
+		let mut results: Vec<SecpOrd> = Vec::with_capacity(10);
+		for ii in 0..10 {
+			results.push(recver.mul_transfer(&[&extensions.0[ii]], &extensions.1, &[&extensions.2[ii]], &extensions.3, &dro, r2[0].as_mut().unwrap()).unwrap()[0]);
+		}
+
+		let childresult: Vec<SecpOrd> = child.join().unwrap();
+		for ii in 0..10 {
+			assert_eq!(results[ii].add(&childresult[ii]), beta[ii].mul(&alpha[ii]));
+		}
+	}
+
+	#[test]
+	fn test_mul_refresh() {
+		let mut rng = rand::thread_rng();
+		let mut refresh_rand = [0u8;HASH_SIZE];
+		rng.fill_bytes(&mut refresh_rand);
+		let mut alpha:Vec<SecpOrd> = Vec::with_capacity(10);
+		let mut alpha_child:Vec<SecpOrd> = Vec::with_capacity(10);
+		for ii in 0..10 {
+			alpha.push(SecpOrd::rand(&mut rng));
+			alpha_child.push(alpha[ii].clone());
+		}
+
+		let (mut sendvec, mut recvvec) = spawn_n2_channelstreams(2);
+
+		let mut s1 = sendvec.remove(0);
+		let mut r1 = recvvec.remove(0);
+
+		let mut s2 = sendvec.remove(0);
+		let mut r2 = recvvec.remove(0);
+
+		let child = thread::spawn(move || {
+			let mut rng = rand::thread_rng();
+			
+			let ro = {
+				let mut r1ref = r1.iter_mut().map(|x| if x.is_some() { x.as_mut() } else { None }).collect::<Vec<Option<&mut _>>>();
+				let mut s1ref = s1.iter_mut().map(|x| if x.is_some() { x.as_mut() } else { None }).collect::<Vec<Option<&mut _>>>();
+				GroupROTagger::from_network_unverified(0, &mut rng, &mut r1ref[..], &mut s1ref[..]).unwrap()
+			};
+
+			let dro = ro.get_dyadic_tagger(1).unwrap();
+			let mut sender = MulSender::new(&ro.get_dyadic_tagger(1).unwrap(), &mut rng, r1[1].as_mut().unwrap(), s1[1].as_mut().unwrap()).unwrap();
+			sender.apply_refresh(&refresh_rand,&dro).unwrap();
+			let extensions = sender.mul_extend(10, &dro, r1[1].as_mut().unwrap()).unwrap();
+			let mut results: Vec<SecpOrd> = Vec::with_capacity(10);
+			for ii in 0..10 {
+				results.push(sender.mul_transfer(&[&alpha_child[ii]], &[&extensions.0[ii]], &extensions.1, &dro, &mut rng, s1[1].as_mut().unwrap()).unwrap()[0]);
+			}
+			results
+		});
+
+		let ro = {
+			let mut r2ref = r2.iter_mut().map(|x| if x.is_some() { x.as_mut() } else { None }).collect::<Vec<Option<&mut _>>>();
+			let mut s2ref = s2.iter_mut().map(|x| if x.is_some() { x.as_mut() } else { None }).collect::<Vec<Option<&mut _>>>();
+			GroupROTagger::from_network_unverified(1, &mut rng, &mut r2ref[..], &mut s2ref[..]).unwrap()
+		};
+
+		let dro = ro.get_dyadic_tagger(0).unwrap();
+		let mut recver = MulRecver::new(&dro, &mut rng, r2[0].as_mut().unwrap(), s2[0].as_mut().unwrap()).unwrap();
+		recver.apply_refresh(&refresh_rand,&dro).unwrap();
 		let mut beta:Vec<SecpOrd> = Vec::with_capacity(10);
 		for _ in 0..10 {
 			beta.push(SecpOrd::rand(&mut rng));

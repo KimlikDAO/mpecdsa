@@ -212,7 +212,7 @@ impl GroupROTagger {
 
 	pub fn apply_subgroup_mask(&mut self, new_mask: &[bool]) -> Result<(),MPECDSAError> {
 		if new_mask.len() != self.puids.len() {panic!("Subgroup mask length does not match player count");}
-		//if !new_mask[self.playerindex] {return Err(MPECDSAError::General(GeneralError::new("Cannot apply subgroup mask that omits active party")));}
+		if new_mask == &self.subgroup_mask[..] { return Ok(()); }
 
 		let mut subgroup_size = 0;
 		for ii in 0..new_mask.len() {

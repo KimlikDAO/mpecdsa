@@ -31,6 +31,7 @@ pub fn process_options() -> Option<Matches> {
     opts.optopt("a", "addresses", "comma-delimited list of IP Addresses", "IP");
 
     opts.optflag("h", "help", "print this help menu");
+    opts.optflag("", "bench_proactive", "benchmark with proactive refreshes");
 
     // threshold flags
     //opts.optopt("T", "threshold", "size of threshold", "THRES");
@@ -168,12 +169,33 @@ fn main() {
     }
 
     println!("Performing {} Iteration Benchmark...", iters);
+    if matches.opt_present("bench_proactive") {
+        let mut refreshpacks = Vec::with_capacity(iters as usize);
+        let setupstart = PreciseTime::now();
+        for _ in 0..iters {
+            refreshpacks.push(signer.sign_and_gen_refresh(&(0usize..index).chain((index+1)..(parties)).collect::<Vec<usize>>(), &"etaoin shrdlu".as_bytes(), &"YDAU".as_bytes(), &mut rng, &mut recvvec, &mut sendvec).unwrap().1);
+        }
+        let setupend = PreciseTime::now();
+        println!("{:.3} ms avg (sign and generate refresh); ", (setupstart.to(setupend).num_milliseconds() as f64)/(iters as f64));
 
-    let setupstart = PreciseTime::now();
-    for _ in 0..iters {
-        signer.sign(&(0usize..index).chain((index+1)..(parties)).collect::<Vec<usize>>(), &"etaoin shrdlu".as_bytes(), &mut rng, &mut recvvec, &mut sendvec).unwrap();
+        let setupstart = PreciseTime::now();
+        for refreshpack in refreshpacks.iter() {
+            signer.apply_refresh(&refreshpack).unwrap();
+        }
+        let setupend = PreciseTime::now();
+        println!("{:.3} ms avg (apply refresh); ", (setupstart.to(setupend).num_milliseconds() as f64)/(iters as f64));
+
+        /*let setupstart = PreciseTime::now();
+        signer.apply_refresh_batch(&refreshpacks);
+        let setupend = PreciseTime::now();
+        println!("{:.3} ms avg (apply refresh, batched); ", (setupstart.to(setupend).num_milliseconds() as f64)/(iters as f64));*/
+    } else {
+        let setupstart = PreciseTime::now();
+        for _ in 0..iters {
+            signer.sign(&(0usize..index).chain((index+1)..(parties)).collect::<Vec<usize>>(), &"etaoin shrdlu".as_bytes(), &mut rng, &mut recvvec, &mut sendvec).unwrap();
+        }
+        let setupend = PreciseTime::now();
+        println!("{:.3} ms avg", (setupstart.to(setupend).num_milliseconds() as f64)/(iters as f64));
     }
-    let setupend = PreciseTime::now();
-    println!("{:.3} ms avg", (setupstart.to(setupend).num_milliseconds() as f64)/(iters as f64));
 
 }

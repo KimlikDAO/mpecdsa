@@ -23,9 +23,12 @@ extern crate curves;
 extern crate time;
 extern crate byteorder;
 extern crate bit_reverse;
-//extern crate openmp_sys;
 extern crate rayon;
 extern crate test;
+
+#[cfg(feature="openmp")]
+extern crate openmp_sys;
+
 
 extern crate crypto;
 use curves::{SecpOrd, Ford};

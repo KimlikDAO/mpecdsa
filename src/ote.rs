@@ -8,6 +8,7 @@
 
 use std::io::{BufWriter};
 use std::result::{Result};
+use std::cmp::min;
 
 use rand::{Rng};
 
@@ -124,6 +125,32 @@ impl OTESender {
 			compressed_correlation,
 			seeds: seeds
 		})
+	}
+
+	pub fn apply_refresh(&mut self, rand: &[u8], ro:&DyadicROTagger) -> Result<(),MPECDSAError> {
+		if rand.len() < HASH_SIZE {return Err(MPECDSAError::General(GeneralError::new("Insufficiently many random bits for safe refresh")));}
+		let mut expanded_rand = vec![0u8;2 * HASH_SIZE * SecpOrd::NBITS + SecpOrd::NBITS/8];
+		let mut source_with_tag = vec![0u8;rand.len() + RO_TAG_SIZE];
+		let mut hashout = [0u8;HASH_SIZE];
+		source_with_tag[RO_TAG_SIZE..].copy_from_slice(&rand[..]);
+		for ii in 0..((expanded_rand.len()+HASH_SIZE-1)/HASH_SIZE) {
+			let offset = ii * HASH_SIZE;
+			let remain = min(expanded_rand.len()-offset, HASH_SIZE);
+			source_with_tag[0..RO_TAG_SIZE].copy_from_slice(&ro.next_dyadic_tag()[..]);
+			hash(&mut hashout, &source_with_tag);
+			expanded_rand[offset..(offset+remain)].copy_from_slice(&hashout[0..remain]);
+		}
+
+		for ii in 0..SecpOrd::NBITS {
+			self.correlation[ii] ^= ((expanded_rand[2 * HASH_SIZE * SecpOrd::NBITS + ii/8] >> (ii%8)) & 1) > 0;
+			for jj in 0..HASH_SIZE {
+				self.seeds[ii][jj] ^= expanded_rand[((self.correlation[ii] as usize) * HASH_SIZE * SecpOrd::NBITS) + ii*HASH_SIZE + jj];
+			}
+		}
+		for ii in 0..SecpOrd::NBYTES {
+			self.compressed_correlation[ii] ^= expanded_rand[2 * HASH_SIZE * SecpOrd::NBITS + ii];
+		}
+		return Ok(());
 	}
 
 	pub fn extend<T:Read>(&self, input_len: usize, ro: &DyadicROTagger, recv:&mut T) -> Result<Vec<u8>,MPECDSAError> {
@@ -341,6 +368,35 @@ impl OTERecver {
 		})
 	}
 
+	pub fn apply_refresh(&mut self, rand: &[u8], ro:&DyadicROTagger) -> Result<(),MPECDSAError> {
+		if rand.len() < HASH_SIZE {return Err(MPECDSAError::General(GeneralError::new("Insufficiently many random bits for safe refresh")));}
+		let mut expanded_rand = vec![0u8;2 * HASH_SIZE * SecpOrd::NBITS + SecpOrd::NBITS/8];
+		let mut source_with_tag = vec![0u8;rand.len() + RO_TAG_SIZE];
+		let mut hashout = [0u8;HASH_SIZE];
+		source_with_tag[RO_TAG_SIZE..].copy_from_slice(&rand[..]);
+		for ii in 0..((expanded_rand.len()+HASH_SIZE-1)/HASH_SIZE) {
+			let offset = ii * HASH_SIZE;
+			let remain = min(expanded_rand.len()-offset, HASH_SIZE);
+			source_with_tag[0..RO_TAG_SIZE].copy_from_slice(&ro.next_dyadic_tag()[..]);
+			hash(&mut hashout, &source_with_tag);
+			expanded_rand[offset..(offset+remain)].copy_from_slice(&hashout[0..remain]);
+		}
+
+		for ii in 0..SecpOrd::NBITS {
+			let correlation_modifier = (expanded_rand[2 * HASH_SIZE * SecpOrd::NBITS + ii/8] >> (ii%8)) & 1;
+			let (seedb,seedinvb) = if correlation_modifier == 1 {(self.seeds[ii].1, self.seeds[ii].0)} else {(self.seeds[ii].0, self.seeds[ii].1)};
+			for jj in 0..HASH_SIZE {
+				expanded_rand[ii * HASH_SIZE + jj] ^= seedb[jj];
+				expanded_rand[HASH_SIZE * SecpOrd::NBITS + ii * HASH_SIZE + jj] ^= seedinvb[jj];
+			}
+		}
+
+		for ii in 0..SecpOrd::NBITS {
+			self.seeds[ii].0[..].copy_from_slice(&expanded_rand[ii * HASH_SIZE..(ii+1) * HASH_SIZE]);
+			self.seeds[ii].1[..].copy_from_slice(&expanded_rand[HASH_SIZE * SecpOrd::NBITS + ii * HASH_SIZE..HASH_SIZE * SecpOrd::NBITS + (ii+1) * HASH_SIZE]);
+		}
+		return Ok(());
+	}
 
 	pub fn extend<T:Write>(&self, choice_bits_in:&[bool], ro: &DyadicROTagger, rng: &mut dyn Rng, send: &mut T) -> Result<Vec<u8>,MPECDSAError> {
 
@@ -656,4 +712,76 @@ mod tests {
 		}
 	}
 
+	#[test]
+	fn test_ote_refresh() {
+		let (mut sendvec, mut recvvec) = spawn_n2_channelstreams(2);
+
+		let mut s1 = sendvec.remove(0);
+		let mut r1 = recvvec.remove(0);
+
+		let mut s2 = sendvec.remove(0);
+		let mut r2 = recvvec.remove(0);
+
+		let child = thread::spawn(move || {
+			let mut rng = rand::thread_rng();
+
+			let ro = {
+				let mut r1ref = r1.iter_mut().map(|x| if x.is_some() { x.as_mut() } else { None }).collect::<Vec<Option<&mut _>>>();
+				let mut s1ref = s1.iter_mut().map(|x| if x.is_some() { x.as_mut() } else { None }).collect::<Vec<Option<&mut _>>>();
+				GroupROTagger::from_network_unverified(0, &mut rng, &mut r1ref[..], &mut s1ref[..]).unwrap()
+			};
+			let sender = OTESender::new(&ro.get_dyadic_tagger(1).unwrap(), &mut rng, r1[1].as_mut().unwrap(), s1[1].as_mut().unwrap()).unwrap();
+			(ro,sender)
+		});
+
+		let mut rng = rand::thread_rng();
+		
+		let ror = {
+			let mut r2ref = r2.iter_mut().map(|x| if x.is_some() { x.as_mut() } else { None }).collect::<Vec<Option<&mut _>>>();
+			let mut s2ref = s2.iter_mut().map(|x| if x.is_some() { x.as_mut() } else { None }).collect::<Vec<Option<&mut _>>>();
+			GroupROTagger::from_network_unverified(1, &mut rng, &mut r2ref[..], &mut s2ref[..]).unwrap()
+		};
+		let mut recver = OTERecver::new(&ror.get_dyadic_tagger(0).unwrap(), &mut rng, r2[0].as_mut().unwrap(), s2[0].as_mut().unwrap()).unwrap();
+
+		let (ros, mut sender) = child.join().unwrap();
+
+		let mut refreshval = [0u8;HASH_SIZE];
+		rng.fill_bytes(&mut refreshval);
+
+		sender.apply_refresh(&refreshval[..], &ros.get_dyadic_tagger(1).unwrap()).unwrap();
+		recver.apply_refresh(&refreshval[..], &ror.get_dyadic_tagger(0).unwrap()).unwrap();
+
+		rng.fill_bytes(&mut refreshval);
+
+		sender.apply_refresh(&refreshval[..], &ros.get_dyadic_tagger(1).unwrap()).unwrap();
+		recver.apply_refresh(&refreshval[..], &ror.get_dyadic_tagger(0).unwrap()).unwrap();
+
+		rng.fill_bytes(&mut refreshval);
+
+		sender.apply_refresh(&refreshval[..], &ros.get_dyadic_tagger(1).unwrap()).unwrap();
+		recver.apply_refresh(&refreshval[..], &ror.get_dyadic_tagger(0).unwrap()).unwrap();
+
+		assert!(sender.correlation.len()>0);
+		for ii in 0..sender.correlation.len() {
+			assert_eq!(sender.seeds[ii], if sender.correlation[ii] {
+				recver.seeds[ii].1
+			} else {
+				recver.seeds[ii].0
+			});
+		}
+
+		rng.fill_bytes(&mut refreshval);
+		sender.apply_refresh(&refreshval[..], &ros.get_dyadic_tagger(1).unwrap()).unwrap();
+
+		rng.fill_bytes(&mut refreshval);
+		recver.apply_refresh(&refreshval[..], &ror.get_dyadic_tagger(0).unwrap()).unwrap();
+
+		for ii in 0..sender.correlation.len() {
+			assert_ne!(sender.seeds[ii], if sender.correlation[ii] {
+				recver.seeds[ii].1
+			} else {
+				recver.seeds[ii].0
+			});
+		}
+	}
 }

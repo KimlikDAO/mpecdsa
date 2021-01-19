@@ -57,6 +57,8 @@ pub struct ThresholdSigner {
 	pktable: Vec<Secp>
 }
 
+pub type ProactiveRefreshPackage = (Secp, Vec<u8>, SecpOrd, Secp, SecpOrd);
+
 impl Alice2P {
 	pub fn new<TR:Read, TW:Write>(ska:&SecpOrd, rng:&mut dyn Rng, recv:&mut TR, send:&mut TW) -> Result<Alice2P, MPECDSAError> {
 		let ro = GroupROTagger::from_network_unverified(0, rng, &mut [None, Some(recv)], &mut [None, Some(send)])?;
@@ -594,6 +596,35 @@ impl ThresholdSigner {
 		}
 	}
 
+	pub fn sign_and_gen_refresh<TR:Read+Send, TW:Write+Send>(&mut self, counterparties: &[usize], msg:&[u8], tag:&[u8], rng:&mut dyn Rng, recv:&mut [Option<TR>], send:&mut [Option<TW>]) -> Result<(Option<(SecpOrd, SecpOrd)>, ProactiveRefreshPackage),MPECDSAError> {
+		if counterparties.len() != (self.threshold-1) {
+			return Err(MPECDSAError::General(GeneralError::new("Number of counterparties does not match threshold.")));
+		}
+
+		if self.threshold == 2 {
+			let counterparty = counterparties[0];
+
+			if self.playerindex > counterparty {
+				let (r,s,p) = self.sign2t_and_gen_refresh_bob(counterparty, msg, Some(tag), rng, recv[counterparty].as_mut().unwrap(), send[counterparty].as_mut().unwrap())?;
+				return Ok((Some((r,s)),p.unwrap()));
+			} else if self.playerindex < counterparty {
+				return Ok((None,self.sign2t_and_gen_refresh_alice(counterparty, msg, Some(tag), rng, recv[counterparty].as_mut().unwrap(), send[counterparty].as_mut().unwrap())?.unwrap()));
+			} else {
+				return Err(MPECDSAError::General(GeneralError::new("Tried to sign with self as counterparty.")));
+			}
+		} else {
+			return Err(MPECDSAError::General(GeneralError::new("Proactive refresh not available for this threshold")));
+		}
+	}
+
+	pub fn apply_refresh(&mut self, refreshpackage: &ProactiveRefreshPackage) -> Result<(), MPECDSAError> {
+		if self.threshold == 2 {
+			self.apply_refresh_2t(refreshpackage)
+		} else {
+			Err(MPECDSAError::General(GeneralError::new("Proactive refresh not available for this threshold")))
+		}
+	}
+
 	fn sign_threshold<TR:Read+Send, TW:Write+Send>(&mut self, counterparties: &[usize], msg:&[u8], rng:&mut dyn Rng, recv:&mut [Option<TR>], send:&mut [Option<TW>]) -> Result<(SecpOrd, SecpOrd),MPECDSAError> {
 		self.ro.apply_subgroup_list(counterparties)?;
 		let sroindex = self.ro.current_broadcast_counter();
@@ -881,9 +912,24 @@ impl ThresholdSigner {
 		}
 	}
 
-	fn sign2t_alice<TR:Read, TW:Write+Send>(&self, counterparty: usize, msg:&[u8], rng:&mut dyn Rng, recv:&mut TR, send:&mut TW) -> Result<(),MPECDSAError> {
-		let mut bufsend = BufWriter::new(send);
+	fn sign2t_alice<TR:Read, TW:Write+Send>(&mut self, counterparty: usize, msg:&[u8], rng:&mut dyn Rng, recv:&mut TR, send:&mut TW) -> Result<(),MPECDSAError> {
+		let res = self.sign2t_and_gen_refresh_alice(counterparty, msg, None, rng, recv, send);
+		if res.is_ok() {
+			Ok(())
+		} else {
+			Err(res.unwrap_err())
+		}
+	}
 
+	fn sign2t_and_gen_refresh_alice<TR:Read, TW:Write+Send>(&mut self, counterparty: usize, msg:&[u8], tag:Option<&[u8]>, rng:&mut dyn Rng, recv:&mut TR, send:&mut TW) -> Result<Option<ProactiveRefreshPackage>,MPECDSAError> {
+		let (parties, prunedcpindex) = if self.playerindex > counterparty {
+			([counterparty, self.playerindex], 0)
+		} else {
+			([self.playerindex, counterparty], 1)
+		};
+		self.ro.apply_subgroup_list(&parties)?;
+		let sroindex = self.ro.current_broadcast_counter();
+		let mut sroindex_raw  = [0u8;8];
 		// precompute things you won't need till later
 
 		// alice's instance key is of a special form for the two round version:
@@ -908,7 +954,9 @@ impl ThresholdSigner {
 		};
 
 		// online phase
-		let dro = self.ro.get_dyadic_tagger(counterparty).unwrap();
+		recv.read_exact(&mut sroindex_raw)?;
+		self.ro.advance_counterparty_broadcast_counter(prunedcpindex, LittleEndian::read_u64(&sroindex_raw))?;
+		let dro = self.ro.get_dyadic_tagger(prunedcpindex).unwrap();
 
 		// recv D_b from bob
 		let mut dbraw = [0u8; Secp::NBYTES];
@@ -955,10 +1003,22 @@ impl ThresholdSigner {
 
 		// end first message (bob to alice)
 
+		let mut bufsend = BufWriter::new(send);
+		LittleEndian::write_u64(&mut sroindex_raw, sroindex);
+		bufsend.write(&sroindex_raw)?;
+
 		// alice sends D'_a = k'_a*G rather than D_a so that bob can check her work
 		bufsend.write(&rprimeraw[RO_TAG_SIZE..])?;
 		bufsend.write(&kaproof_buf[(RO_TAG_SIZE + Secp::NBYTES)..])?;
 		bufsend.flush()?;
+
+		// optional: proactive refresh
+		let (refreshpackage, mut bufsend) = if let Some(tag) = tag {
+			let send = bufsend.into_inner().map_err(|_| MPECDSAError::General(GeneralError::new("Buffer unwrap error"))).unwrap();
+			(Some(self.gen_refresh_2t(&r, tag, counterparty, prunedcpindex, rng, recv, send)?), BufWriter::new(send))
+		} else {
+			(None, bufsend)
+		};
 
 		// perform two multiplications with 1/k_a and sk_a/k_a.
 		let t12 = multiplier.mul_transfer(&[&kai.add(&kapad),&t0ai,&kai], &[&extensions.0[0],&extensions.0[0],&extensions.0[1]], &extensions.1, &dro, rng, &mut bufsend)?;
@@ -1006,11 +1066,31 @@ impl ThresholdSigner {
 
 		// end second message (alice to bob)
 
-		Ok(())
+		Ok(refreshpackage)
 	}
 
-	fn sign2t_bob <TR: Read, TW: Write>(&self, counterparty: usize, msg:&[u8], rng:&mut dyn Rng, recv: &mut TR, send: &mut TW) -> Result<(SecpOrd, SecpOrd),MPECDSAError> {
+	fn sign2t_bob<TR:Read, TW:Write+Send>(&mut self, counterparty: usize, msg:&[u8], rng:&mut dyn Rng, recv:&mut TR, send:&mut TW) -> Result<(SecpOrd, SecpOrd),MPECDSAError> {
+		let res = self.sign2t_and_gen_refresh_bob(counterparty, msg, None, rng, recv, send);
+		if let Ok((r0,r1,_)) = res {
+			Ok((r0, r1))
+		} else {
+			Err(res.unwrap_err())
+		}
+	}
+
+	fn sign2t_and_gen_refresh_bob <TR: Read, TW: Write>(&mut self, counterparty: usize, msg:&[u8], tag:Option<&[u8]>, rng:&mut dyn Rng, recv: &mut TR, send: &mut TW) -> Result<(SecpOrd, SecpOrd, Option<ProactiveRefreshPackage>),MPECDSAError> {
+		let (parties, prunedcpindex) = if self.playerindex > counterparty {
+			([counterparty, self.playerindex], 0)
+		} else {
+			([self.playerindex, counterparty], 1)
+		};
+		self.ro.apply_subgroup_list(&parties)?;
+		let sroindex = self.ro.current_broadcast_counter();
+		let mut sroindex_raw  = [0u8;8];
+		LittleEndian::write_u64(&mut sroindex_raw, sroindex);
+
 		let mut bufsend = BufWriter::new(send);
+		bufsend.write(&sroindex_raw)?;
 
 		let multiplier = match self.multiplier[counterparty] {
 			MulPlayer::Recver(ref multiplier) => multiplier,
@@ -1031,7 +1111,7 @@ impl ThresholdSigner {
 		coef = coef.mul(&(SecpOrd::from_native((counterparty+1) as u64).sub(&SecpOrd::from_native((self.playerindex+1) as u64))).inv());
 		let t0b = coef.mul(&self.poly_point);
 
-		let dro = self.ro.get_dyadic_tagger(counterparty).unwrap();
+		let dro = self.ro.get_dyadic_tagger(prunedcpindex).unwrap();
 		let rprime_tag = dro.next_dyadic_tag();
 		let kaproof_tag = dro.next_dyadic_tag();
 
@@ -1043,6 +1123,8 @@ impl ThresholdSigner {
 		bufsend.flush()?;
 
 		// end first message (bob to alice)
+		recv.read_exact(&mut sroindex_raw)?;
+		self.ro.advance_counterparty_broadcast_counter(prunedcpindex, LittleEndian::read_u64(&sroindex_raw))?;
 
 		// receive D'_a from alice, calculate D_a as D_a = H(D'_a)*G + D'_a
 		let mut rprimeraw = [0u8;Secp::NBYTES+RO_TAG_SIZE];
@@ -1076,6 +1158,14 @@ impl ThresholdSigner {
 		if kaproof_lhs != kaproof_rhs {
 			return Err(MPECDSAError::Proof(ProofError::new("Proof of Knowledge failed for ECDSA signing (alice cheated)")))
 		}
+
+		// optional: proactive refresh
+		let refreshpackage = if let Some(tag) = tag {
+			let send = bufsend.into_inner().map_err(|_| MPECDSAError::General(GeneralError::new("Buffer unwrap error"))).unwrap();
+			Some(self.gen_refresh_2t(&r, tag, counterparty, prunedcpindex, rng, recv, send)?)
+		} else {
+			None
+		};
 
 		// hash message
 		let mut z = [0u8; HASH_SIZE];
@@ -1130,9 +1220,110 @@ impl ThresholdSigner {
 
 		// verify signature. Abort if it's incorrect.
 		if ecdsa::ecdsa_verify_with_tables(msg, (&rx, &s), &precomp::P256_TABLE, &self.pktable[..]) {
-			Ok((rx, s))
+			Ok((rx, s, refreshpackage))
 		} else {
 			Err(MPECDSAError::Proof(ProofError::new("Signature verification failed for ECDSA signing (alice cheated)")))
+		}
+	}
+
+	fn gen_refresh_2t <TR:Read, TW:Write>(&self, R: &Secp, tag: &[u8], counterparty:usize, prunedcpindex:usize, rng: &mut dyn Rng, recv: &mut TR, send: &mut TW) -> Result<ProactiveRefreshPackage,MPECDSAError> {
+		let my_coin = SecpOrd::rand(rng);
+		let (my_nonce_dl, my_nonce) = Secp::rand(rng);
+		let mut coin_raw = [0u8;SecpOrd::NBYTES + RO_TAG_SIZE];
+		let mut nonce_raw = [0u8;Secp::NBYTES];
+		let mut coincom = [0u8;HASH_SIZE];
+		my_coin.to_bytes(&mut coin_raw[RO_TAG_SIZE..]);
+		my_nonce.to_bytes(&mut nonce_raw);
+		coin_raw[0..RO_TAG_SIZE].copy_from_slice(&self.ro.next_broadcast_tag()[..]);
+		hash(&mut coincom, &coin_raw);
+		let (mut prfcom,proof) = prove_dl_fs_to_com(&my_nonce_dl, &my_nonce, &ModelessGroupROTagger::new(&self.ro, false), rng).unwrap();
+		send.write(&coincom)?;
+		send.write(&prfcom)?;
+		send.flush()?;
+
+		recv.read_exact(&mut coincom)?;
+		recv.read_exact(&mut prfcom)?;
+
+		send.write(&coin_raw[RO_TAG_SIZE..])?;
+		send.write(&nonce_raw)?;
+		send.write(&proof)?;
+		send.flush()?;
+
+		recv.read_exact(&mut coin_raw[RO_TAG_SIZE..])?;
+		coin_raw[0..RO_TAG_SIZE].copy_from_slice(&self.ro.next_counterparty_broadcast_tag(prunedcpindex).unwrap()[..]);
+		let mut coincomcomp = [0u8;HASH_SIZE];
+		hash(&mut coincomcomp, &coin_raw);
+		if coincom != coincomcomp {
+			return Err(MPECDSAError::Proof(ProofError::new("Counterparty decommitted incorrectly in proactive refresh")));
+		}
+
+		recv.read_exact(&mut nonce_raw)?;
+		let cp_nonce = Secp::from_bytes(&nonce_raw);
+		let proofresult = verify_dl_fs_with_com(&cp_nonce, &prfcom, &ModelessDyadicROTagger::new(&self.ro.get_dyadic_tagger(prunedcpindex).unwrap(), false), recv)?;
+
+		if !proofresult {
+			return Err(MPECDSAError::Proof(ProofError::new("Counterparty failed to prove discrete log in proactive refresh")));
+		}
+
+		let schnorr_nonce = Secp::op(&my_nonce, &cp_nonce).affine();
+		let coin = my_coin.add(&SecpOrd::from_bytes(&coin_raw[RO_TAG_SIZE..]));
+
+		let mut schnorr_e_in = vec![0u8;2*Secp::NBYTES + SecpOrd::NBYTES + tag.len()];
+		R.to_bytes(&mut schnorr_e_in[0..Secp::NBYTES]);
+		schnorr_nonce.to_bytes(&mut schnorr_e_in[Secp::NBYTES..2*Secp::NBYTES]);
+		coin.to_bytes(&mut schnorr_e_in[2*Secp::NBYTES..2*Secp::NBYTES+SecpOrd::NBYTES]);
+
+		let mut schnorr_e = [0u8;HASH_SIZE];
+		hash(&mut schnorr_e, &schnorr_e_in);
+		let schnorr_e = SecpOrd::from_bytes(&schnorr_e);
+
+		// calculate lagrange coefficient
+		let mut coef = SecpOrd::from_native((counterparty+1) as u64);
+		coef = coef.mul(&(SecpOrd::from_native((counterparty+1) as u64).sub(&SecpOrd::from_native((self.playerindex+1) as u64))).inv());
+		let my_sk = coef.mul(&self.poly_point);
+		let schnorr_z = my_sk.mul(&schnorr_e).add(&my_nonce_dl);
+		let mut schnorr_z_raw = [0u8;SecpOrd::NBYTES];
+		schnorr_z.to_bytes(&mut schnorr_z_raw);
+
+		send.write(&schnorr_z_raw)?;
+		send.flush()?;
+		recv.read_exact(&mut schnorr_z_raw)?;
+		let cp_schnorr_z = SecpOrd::from_bytes(&schnorr_z_raw);
+
+		let cp_pk_e = Secp::op(&self.pk, &Secp::scalar_table_multi(&precomp::P256_TABLE[..], &my_sk).neg()).scalar_table(&schnorr_e);
+
+		if Secp::scalar_table_multi(&precomp::P256_TABLE[..], &cp_schnorr_z).affine() != Secp::op(&cp_pk_e, &cp_nonce).affine() {
+			return Err(MPECDSAError::Proof(ProofError::new("Counterparty refresh signature failed to verify")));
+		}
+
+		Ok((*R, tag.to_vec(), coin, schnorr_nonce, schnorr_z.add(&cp_schnorr_z)))
+	}
+
+	fn apply_refresh_2t(&mut self, refreshpackage: &ProactiveRefreshPackage) -> Result<(),MPECDSAError> {
+		let (R, tag, coin, schnorr_nonce, schnorr_z) = refreshpackage;
+		self.ro.remove_subgroup_mask();
+
+		let mut schnorr_e_in = vec![0u8;2*Secp::NBYTES + SecpOrd::NBYTES + tag.len()];
+		R.to_bytes(&mut schnorr_e_in[0..Secp::NBYTES]);
+		schnorr_nonce.to_bytes(&mut schnorr_e_in[Secp::NBYTES..2*Secp::NBYTES]);
+		coin.to_bytes(&mut schnorr_e_in[2*Secp::NBYTES..2*Secp::NBYTES+SecpOrd::NBYTES]);
+
+		let mut schnorr_e = [0u8;HASH_SIZE];
+		hash(&mut schnorr_e, &schnorr_e_in);
+		let schnorr_e = SecpOrd::from_bytes(&schnorr_e);
+
+		if Secp::scalar_table_multi(&precomp::P256_TABLE[..], &schnorr_z).affine() != Secp::op(&self.pk.scalar_table(&schnorr_e), &schnorr_nonce).affine() {
+			Err(MPECDSAError::Proof(ProofError::new("Refresh Package failed to verify")))
+		} else {
+			self.poly_point = self.poly_point.add(&coin.mul(&SecpOrd::from_native((self.playerindex + 1) as u64)));
+			for (ii,mulinstance) in self.multiplier.iter_mut().enumerate() {
+				match mulinstance {
+					MulPlayer::Sender(m) => {m.apply_refresh(&schnorr_e_in[2*Secp::NBYTES..2*Secp::NBYTES+SecpOrd::NBYTES], &self.ro.get_dyadic_tagger(ii).unwrap()).unwrap();},
+					MulPlayer::Recver(m) => {m.apply_refresh(&schnorr_e_in[2*Secp::NBYTES..2*Secp::NBYTES+SecpOrd::NBYTES], &self.ro.get_dyadic_tagger(ii).unwrap()).unwrap();},
+					MulPlayer::Null => {}
+				};
+			}
+			Ok(())
 		}
 	}
 }
@@ -1264,6 +1455,161 @@ mod tests {
 		let charlie = thandlec.join().unwrap();
 		assert!(charlie.0.is_ok());
 		assert!(charlie.1.is_ok());
+	}
+
+	#[test]
+	fn test_mpecdsa_3p2trefresh_gen() {
+
+		let (mut sendvec, mut recvvec) = spawn_n2_channelstreams(3);
+
+		let mut s0 = sendvec.remove(0);
+		let mut r0 = recvvec.remove(0);
+
+		let thandlea = thread::spawn(move || {
+			let mut rng = rand::thread_rng();
+			let mut alice = ThresholdSigner::new(0, 2, &mut rng, &mut r0[..], &mut s0[..]).unwrap();
+			let result1 = alice.sign_and_gen_refresh(&[1], &"The Quick Brown Fox Jumped Over The Lazy Dog".as_bytes(), &"YW".as_bytes(), &mut rng, &mut r0[..], &mut s0[..]);
+			let result2 = alice.sign_and_gen_refresh(&[2], &"etaoin shrdlu".as_bytes(), &"YTMP".as_bytes(), &mut rng, &mut r0[..], &mut s0[..]);
+			(result1, result2)
+		});
+
+		let mut s1 = sendvec.remove(0);
+		let mut r1 = recvvec.remove(0);
+
+		let thandleb = thread::spawn(move || {
+			let mut rng = rand::thread_rng();
+			let mut bob = ThresholdSigner::new(1, 2, &mut rng, &mut r1[..], &mut s1[..]).unwrap();
+			let result1 = bob.sign_and_gen_refresh(&[0], &"The Quick Brown Fox Jumped Over The Lazy Dog".as_bytes(), &"YW".as_bytes(), &mut rng, &mut r1[..], &mut s1[..]);
+			let result2 = bob.sign_and_gen_refresh(&[2], &"Lorem ipsum dolor sit amet".as_bytes(), &"YWQMD".as_bytes(), &mut rng, &mut r1[..], &mut s1[..]);
+			(result1, result2)
+		});
+
+		let mut s2 = sendvec.remove(0);
+		let mut r2 = recvvec.remove(0);
+		
+		let thandlec = thread::spawn(move || {
+			let mut rng = rand::thread_rng();
+			let mut charlie = ThresholdSigner::new(2, 2, &mut rng, &mut r2[..], &mut s2[..]).unwrap();
+			let result1 = charlie.sign_and_gen_refresh(&[0], &"etaoin shrdlu".as_bytes(), &"YTMP".as_bytes(), &mut rng, &mut r2[..], &mut s2[..]);
+			let result2 = charlie.sign_and_gen_refresh(&[1], &"Lorem ipsum dolor sit amet".as_bytes(), &"YWQMD".as_bytes(), &mut rng, &mut r2[..], &mut s2[..]);
+			(result1, result2)
+		});
+
+		let alice = thandlea.join().unwrap();
+		assert!(alice.0.is_ok());
+		assert!(alice.1.is_ok());
+		let bob = thandleb.join().unwrap();
+		assert!(bob.0.is_ok());
+		assert!(bob.1.is_ok());
+		let charlie = thandlec.join().unwrap();
+		assert!(charlie.0.is_ok());
+		assert!(charlie.1.is_ok());
+	}
+
+	#[test]
+	fn test_mpecdsa_3p2trefresh_gen_apply() {
+
+		let (mut sendvec, mut recvvec) = spawn_n2_channelstreams(3);
+
+		let mut s0 = sendvec.remove(0);
+		let mut r0 = recvvec.remove(0);
+
+		let thandlea = thread::spawn(move || {
+			let mut rng = rand::thread_rng();
+			let mut alice = ThresholdSigner::new(0, 2, &mut rng, &mut r0[..], &mut s0[..]).unwrap();
+			let result1 = alice.sign_and_gen_refresh(&[1], &"The Quick Brown Fox Jumped Over The Lazy Dog".as_bytes(), &"YW".as_bytes(), &mut rng, &mut r0[..], &mut s0[..]);
+			let result2 = alice.sign_and_gen_refresh(&[2], &"etaoin shrdlu".as_bytes(), &"YTMP".as_bytes(), &mut rng, &mut r0[..], &mut s0[..]);
+			(result1, result2, alice)
+		});
+
+		let mut s1 = sendvec.remove(0);
+		let mut r1 = recvvec.remove(0);
+
+		let thandleb = thread::spawn(move || {
+			let mut rng = rand::thread_rng();
+			let mut bob = ThresholdSigner::new(1, 2, &mut rng, &mut r1[..], &mut s1[..]).unwrap();
+			let result1 = bob.sign_and_gen_refresh(&[0], &"The Quick Brown Fox Jumped Over The Lazy Dog".as_bytes(), &"YW".as_bytes(), &mut rng, &mut r1[..], &mut s1[..]);
+			let result2 = bob.sign_and_gen_refresh(&[2], &"Lorem ipsum dolor sit amet".as_bytes(), &"YWQMD".as_bytes(), &mut rng, &mut r1[..], &mut s1[..]);
+			(result1, result2, bob)
+		});
+
+		let mut s2 = sendvec.remove(0);
+		let mut r2 = recvvec.remove(0);
+		
+		let thandlec = thread::spawn(move || {
+			let mut rng = rand::thread_rng();
+			let mut charlie = ThresholdSigner::new(2, 2, &mut rng, &mut r2[..], &mut s2[..]).unwrap();
+			let result1 = charlie.sign_and_gen_refresh(&[0], &"etaoin shrdlu".as_bytes(), &"YTMP".as_bytes(), &mut rng, &mut r2[..], &mut s2[..]);
+			let result2 = charlie.sign_and_gen_refresh(&[1], &"Lorem ipsum dolor sit amet".as_bytes(), &"YWQMD".as_bytes(), &mut rng, &mut r2[..], &mut s2[..]);
+			(result1, result2, charlie)
+		});
+
+		let aliceout = thandlea.join().unwrap();
+		assert!(aliceout.0.is_ok());
+		assert!(aliceout.1.is_ok());
+		let bobout = thandleb.join().unwrap();
+		assert!(bobout.0.is_ok());
+		assert!(bobout.1.is_ok());
+		let charlieout = thandlec.join().unwrap();
+		assert!(charlieout.0.is_ok());
+		assert!(charlieout.1.is_ok());
+
+		if let ((Ok((_,ar0)),Ok((_,ar1)),mut alice), (Ok((_,br0)),Ok((_,br1)),mut bob), (Ok((_,cr0)),Ok((_,cr1)),mut charlie)) = (aliceout, bobout, charlieout) {
+			for refpack in [ar0,br0,cr0,ar1,br1,cr1].iter() {
+				assert!(alice.apply_refresh(&refpack).is_ok());
+				assert!(bob.apply_refresh(&refpack).is_ok());
+				assert!(charlie.apply_refresh(&refpack).is_ok());
+			}
+
+			let (mut sendvec, mut recvvec) = spawn_n2_channelstreams(3);
+
+			let mut s0 = sendvec.remove(0);
+			let mut r0 = recvvec.remove(0);
+
+			let thandlea = thread::spawn(move || {
+				let mut rng = rand::thread_rng();
+				let result1 = alice.sign_and_gen_refresh(&[1], &"The Quick Brown Fox Jumped Over The Lazy Dog".as_bytes(), &"YW".as_bytes(), &mut rng, &mut r0[..], &mut s0[..]);
+				let result2 = alice.sign_and_gen_refresh(&[2], &"etaoin shrdlu".as_bytes(), &"YTMP".as_bytes(), &mut rng, &mut r0[..], &mut s0[..]);
+				(result1, result2)
+			});
+
+			let mut s1 = sendvec.remove(0);
+			let mut r1 = recvvec.remove(0);
+
+			let thandleb = thread::spawn(move || {
+				let mut rng = rand::thread_rng();
+				let result1 = bob.sign_and_gen_refresh(&[0], &"The Quick Brown Fox Jumped Over The Lazy Dog".as_bytes(), &"YW".as_bytes(), &mut rng, &mut r1[..], &mut s1[..]);
+				let result2 = bob.sign_and_gen_refresh(&[2], &"Lorem ipsum dolor sit amet".as_bytes(), &"YWQMD".as_bytes(), &mut rng, &mut r1[..], &mut s1[..]);
+				(result1, result2)
+			});
+
+			let mut s2 = sendvec.remove(0);
+			let mut r2 = recvvec.remove(0);
+			
+			let thandlec = thread::spawn(move || {
+				let mut rng = rand::thread_rng();
+				let result1 = charlie.sign_and_gen_refresh(&[0], &"etaoin shrdlu".as_bytes(), &"YTMP".as_bytes(), &mut rng, &mut r2[..], &mut s2[..]);
+				let result2 = charlie.sign_and_gen_refresh(&[1], &"Lorem ipsum dolor sit amet".as_bytes(), &"YWQMD".as_bytes(), &mut rng, &mut r2[..], &mut s2[..]);
+				(result1, result2)
+			});
+
+			let aliceout = thandlea.join().unwrap();
+			match aliceout.0 {
+			    Ok(_) => println!("working"),
+			    Err(e) => println!("{:?}", e),
+			}
+			//assert!(aliceout.0.is_ok());
+			assert!(aliceout.1.is_ok());
+			let bobout = thandleb.join().unwrap();
+			assert!(bobout.0.is_ok());
+			assert!(bobout.1.is_ok());
+			let charlieout = thandlec.join().unwrap();
+			assert!(charlieout.0.is_ok());
+			assert!(charlieout.1.is_ok());
+
+		} else {
+			assert!(false);
+		}
 	}
 
 	#[test]

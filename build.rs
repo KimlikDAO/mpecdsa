@@ -12,11 +12,16 @@ fn main() {
 	let out_dir = env::var("OUT_DIR").unwrap();
 	println!("cargo:rustc-link-search=native={}", out_dir);
 
-	let extra_args = if std::env::var("TARGET").unwrap().contains("apple-darwin") {
-		vec!["-Wa,-q", "-O3", "-fPIC"]
-	} else {
-		vec!["-O3", "-fPIC"]
-	};
+	let mut extra_args = vec!["-O3", "-fPIC"];
+
+	if std::env::var("TARGET").unwrap().contains("apple-darwin") {
+		extra_args.push("-Wa,-q")
+	}
+
+	let omp_flag = env::var("DEP_OPENMP_FLAG").unwrap_or("".to_string());
+	if cfg!(feature="openmp") {
+		extra_args.push(&omp_flag);
+	}
 
 	let cc = if std::env::var("CC").is_ok() {
 		std::env::var("CC").unwrap()
@@ -32,7 +37,7 @@ fn main() {
 
 	if std::env::var("TARGET").unwrap().contains("x86_64") {
 		Command::new(&cc).args(&["src/sha256_octa.c", "-c", "-mavx2", "-o"])
-					.arg(&format!("{}/sha256_multi.o", out_dir))//.arg(&env::var("DEP_OPENMP_FLAG").unwrap())
+					.arg(&format!("{}/sha256_multi.o", out_dir))
 					.args(&extra_args).status().unwrap();
 		Command::new(&ar).args(&["-crus", "libsha256_multi.a", "sha256_multi.o"])
 					.current_dir(&Path::new(&out_dir))
@@ -65,7 +70,7 @@ fn main() {
 	}
 
 	Command::new(&cc).args(&["src/blake2_multi.c", "-c", "-o"])
-					.arg(&format!("{}/blake2_multi.o", out_dir))//.arg(&env::var("DEP_OPENMP_FLAG").unwrap())
+					.arg(&format!("{}/blake2_multi.o", out_dir))
 					.args(&extra_args).status().unwrap();
 	Command::new(&ar).args(&["-crus", "libblake2.a", "blake2s.o", "blake2sp.o", "blake2_multi.o"])
 					.current_dir(&Path::new(&out_dir))
