@@ -1,22 +1,14 @@
-/// Benchmarking for 2 of n signing
-
-use std::time::Duration;
-use std::thread::sleep;
-use std::io::{Write, Read};
-
+use std::env;
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::{env};
+use std::thread::sleep;
+use std::time::Duration;
 
 extern crate rand;
-use rand::{Rng};
+use rand::Rng;
 
-extern crate time;
-use time::PreciseTime;
-
-extern crate mpecdsa;
-
-extern crate getopts;
-use self::getopts::{Options, Matches};
+use getopts::{Matches, Options};
+use std::time::Instant;
 
 // options from bench_sign; update for n party
 pub fn process_options() -> Option<Matches> {
@@ -26,9 +18,19 @@ pub fn process_options() -> Option<Matches> {
 
     let mut opts = Options::new();
     opts.optopt("o", "", "set output file name", "NAME");
-    opts.optopt("p", "port", "lowest port (the required number will be allocated above)", "PORT");
+    opts.optopt(
+        "p",
+        "port",
+        "lowest port (the required number will be allocated above)",
+        "PORT",
+    );
     opts.optopt("n", "iterations", "number of iterations", "ITERS");
-    opts.optopt("a", "addresses", "comma-delimited list of IP Addresses", "IP");
+    opts.optopt(
+        "a",
+        "addresses",
+        "comma-delimited list of IP Addresses",
+        "IP",
+    );
 
     opts.optflag("h", "help", "print this help menu");
     opts.optflag("", "bench_proactive", "benchmark with proactive refreshes");
@@ -39,8 +41,10 @@ pub fn process_options() -> Option<Matches> {
     opts.optopt("P", "party", "party number", "PARTY");
 
     let matches = match opts.parse(&args[1..]) {
-        Ok(m) => { m }
-        Err(f) => { panic!(f.to_string()) }
+        Ok(m) => m,
+        Err(f) => {
+            panic!("{}", f.to_string())
+        }
     };
 
     if matches.opt_present("h") {
@@ -49,14 +53,11 @@ pub fn process_options() -> Option<Matches> {
         print!("{}", opts.usage(&brief));
         return Option::None;
     }
-     
-    return Option::Some(matches);
 
+    return Option::Some(matches);
 }
 
-
 fn main() {
-
     let matches = process_options();
     if let None = matches {
         ::std::process::exit(1);
@@ -64,25 +65,33 @@ fn main() {
     let matches = matches.unwrap();
 
     // number of parties
-    let parties = matches.opt_str("N").unwrap_or("2".to_owned()).parse::<usize>().unwrap();
+    let parties = matches
+        .opt_str("N")
+        .unwrap_or("2".to_owned())
+        .parse::<usize>()
+        .unwrap();
     //let thres = matches.opt_str("T").unwrap_or("2".to_owned()).parse::<usize>().unwrap();
     // If party index isn't specified, assume 2P
     let index = matches.opt_str("P").unwrap().parse::<usize>().unwrap();
-    let mut sendvec:Vec<Option<std::net::TcpStream>> = Vec::with_capacity(parties);
+    let mut sendvec: Vec<Option<std::net::TcpStream>> = Vec::with_capacity(parties);
     let mut recvvec: Vec<Option<std::net::TcpStream>> = Vec::with_capacity(parties);
 
-    if !matches.opt_present("p") && parties!=2 {
+    if !matches.opt_present("p") && parties != 2 {
         println!("Please add ports");
         ::std::process::exit(1);
     }
-    
+
     // ports should be separated by commas
     let addrs = matches.opt_str("a").unwrap_or("0.0.0.0".to_owned());
     let addrs: Vec<&str> = addrs.split(",").collect();
-    let port: usize = matches.opt_str("p").unwrap_or("12345".to_owned()).parse().unwrap();
+    let port: usize = matches
+        .opt_str("p")
+        .unwrap_or("12345".to_owned())
+        .parse()
+        .unwrap();
     let min_ports = parties;
     let mut ports = Vec::with_capacity(min_ports);
-    for ii in port..(port+min_ports) {
+    for ii in port..(port + min_ports) {
         ports.push(format!("{}", ii));
     }
 
@@ -99,8 +108,8 @@ fn main() {
             let port_index = jj;
             let port = format!("0.0.0.0:{}", &ports[port_index]);
             println!("{} waiting for {} to connect on {}", index, jj, port);
-            let listener = TcpListener::bind(port).unwrap_or_else(|e| { panic!(e) });
-            let (recv, _) = listener.accept().unwrap_or_else(|e| {panic!(e)} );
+            let listener = TcpListener::bind(port).unwrap_or_else(|e| panic!("{}", e));
+            let (recv, _) = listener.accept().unwrap_or_else(|e| panic!("{}", e));
             let send = recv.try_clone().unwrap();
             recv.set_nodelay(true).expect("Could not set nodelay");
             send.set_nodelay(true).expect("Could not set nodelay");
@@ -111,12 +120,12 @@ fn main() {
             let port = format!("{}:{}", addrs[jj], &ports[port_index]);
             println!("{} connecting to {} server {:?}...", index, jj, port);
             let mut send = TcpStream::connect(&port);
-            let connection_wait_time = 2*60;
+            let connection_wait_time = 2 * 60;
             let poll_interval = 100;
-            for _ in 0..(connection_wait_time*1000/poll_interval) {
+            for _ in 0..(connection_wait_time * 1000 / poll_interval) {
                 if send.is_err() {
                     sleep(Duration::from_millis(poll_interval));
-                    send = TcpStream::connect(&port);    
+                    send = TcpStream::connect(&port);
                 }
             }
             let send = send.unwrap();
@@ -132,70 +141,152 @@ fn main() {
             recvvec.push(None);
         }
     }
-    
-    let iters = matches.opt_str("n").unwrap_or("1000".to_owned()).parse::<i32>().unwrap();
+
+    let iters = matches
+        .opt_str("n")
+        .unwrap_or("1000".to_owned())
+        .parse::<i32>()
+        .unwrap();
     let mut seeder = rand::os::OsRng::new().unwrap();
     let mut rng = rand::ChaChaRng::new_unseeded();
     rng.set_counter(seeder.gen::<u64>(), seeder.gen::<u64>());
 
-    if index==parties-1 {
-        for ii in 0..parties-1 {
-            sendvec[ii].as_mut().unwrap().write(&[0]).expect(&format!("Party {} failed to send ready signal.", index));
-            sendvec[ii].as_mut().unwrap().flush().expect(&format!("Party {} failed to flush.", index));
+    if index == parties - 1 {
+        for ii in 0..parties - 1 {
+            sendvec[ii]
+                .as_mut()
+                .unwrap()
+                .write(&[0])
+                .expect(&format!("Party {} failed to send ready signal.", index));
+            sendvec[ii]
+                .as_mut()
+                .unwrap()
+                .flush()
+                .expect(&format!("Party {} failed to flush.", index));
         }
     } else {
         let mut sigread = [1u8; 1];
-        recvvec[parties-1].as_mut().unwrap().read_exact(&mut sigread).expect(&format!("Party {} failed to read ready signal.", index));
+        recvvec[parties - 1]
+            .as_mut()
+            .unwrap()
+            .read_exact(&mut sigread)
+            .expect(&format!("Party {} failed to read ready signal.", index));
     }
 
     println!("{} connected. Initializing...", index);
 
-    let mut signer = mpecdsa::mpecdsa::ThresholdSigner::new(index, parties, &mut rng, sendvec.as_mut_slice(), recvvec.as_mut_slice()).unwrap();
+    let mut signer = mpecdsa::mpecdsa::ThresholdSigner::new(
+        index,
+        parties,
+        &mut rng,
+        sendvec.as_mut_slice(),
+        recvvec.as_mut_slice(),
+    )
+    .unwrap();
 
-    if index==parties-1 {
+    if index == parties - 1 {
         let mut sigread = [1u8; 1];
-        for ii in 0..parties-1 {
-            recvvec[ii].as_mut().unwrap().read_exact(&mut sigread).expect(&format!("Party {} failed to send ready signal.", ii));
+        for ii in 0..parties - 1 {
+            recvvec[ii]
+                .as_mut()
+                .unwrap()
+                .read_exact(&mut sigread)
+                .expect(&format!("Party {} failed to send ready signal.", ii));
         }
-        for ii in 0..parties-1 {
-            sendvec[ii].as_mut().unwrap().write(&[0]).expect(&format!("Party {} failed to send ready signal.", index));
-            sendvec[ii].as_mut().unwrap().flush().expect(&format!("Party {} failed to flush.", index));
+        for ii in 0..parties - 1 {
+            sendvec[ii]
+                .as_mut()
+                .unwrap()
+                .write(&[0])
+                .expect(&format!("Party {} failed to send ready signal.", index));
+            sendvec[ii]
+                .as_mut()
+                .unwrap()
+                .flush()
+                .expect(&format!("Party {} failed to flush.", index));
         }
     } else {
         let mut sigread = [1u8; 1];
-        sendvec[parties-1].as_mut().unwrap().write(&[0]).expect(&format!("Party {} failed to send ready signal.", index));
-        sendvec[parties-1].as_mut().unwrap().flush().expect(&format!("Party {} failed to flush.", index));
-        recvvec[parties-1].as_mut().unwrap().read_exact(&mut sigread).expect(&format!("Party {} failed to send ready signal.", parties-1));
+        sendvec[parties - 1]
+            .as_mut()
+            .unwrap()
+            .write(&[0])
+            .expect(&format!("Party {} failed to send ready signal.", index));
+        sendvec[parties - 1]
+            .as_mut()
+            .unwrap()
+            .flush()
+            .expect(&format!("Party {} failed to flush.", index));
+        recvvec[parties - 1]
+            .as_mut()
+            .unwrap()
+            .read_exact(&mut sigread)
+            .expect(&format!(
+                "Party {} failed to send ready signal.",
+                parties - 1
+            ));
     }
 
     println!("Performing {} Iteration Benchmark...", iters);
     if matches.opt_present("bench_proactive") {
         let mut refreshpacks = Vec::with_capacity(iters as usize);
-        let setupstart = PreciseTime::now();
+        let start = Instant::now();
         for _ in 0..iters {
-            refreshpacks.push(signer.sign_and_gen_refresh(&(0usize..index).chain((index+1)..(parties)).collect::<Vec<usize>>(), &"etaoin shrdlu".as_bytes(), &"YDAU".as_bytes(), &mut rng, &mut recvvec, &mut sendvec).unwrap().1);
+            refreshpacks.push(
+                signer
+                    .sign_and_gen_refresh(
+                        &(0usize..index)
+                            .chain((index + 1)..(parties))
+                            .collect::<Vec<usize>>(),
+                        &"etaoin shrdlu".as_bytes(),
+                        &"YDAU".as_bytes(),
+                        &mut rng,
+                        &mut recvvec,
+                        &mut sendvec,
+                    )
+                    .unwrap()
+                    .1,
+            );
         }
-        let setupend = PreciseTime::now();
-        println!("{:.3} ms avg (sign and generate refresh); ", (setupstart.to(setupend).num_milliseconds() as f64)/(iters as f64));
+        let duration = start.elapsed();
+        println!(
+            "{:.3} ms avg (sign and generate refresh); ",
+            (duration.as_millis() as f64) / (iters as f64)
+        );
 
-        let setupstart = PreciseTime::now();
+        let start = Instant::now();
         for refreshpack in refreshpacks.iter() {
             signer.apply_refresh(&refreshpack).unwrap();
         }
-        let setupend = PreciseTime::now();
-        println!("{:.3} ms avg (apply refresh); ", (setupstart.to(setupend).num_milliseconds() as f64)/(iters as f64));
+        let duration = start.elapsed();
+        println!(
+            "{:.3} ms avg (apply refresh); ",
+            (duration.as_millis() as f64) / (iters as f64)
+        );
 
         /*let setupstart = PreciseTime::now();
         signer.apply_refresh_batch(&refreshpacks);
         let setupend = PreciseTime::now();
         println!("{:.3} ms avg (apply refresh, batched); ", (setupstart.to(setupend).num_milliseconds() as f64)/(iters as f64));*/
     } else {
-        let setupstart = PreciseTime::now();
+        let start = Instant::now();
         for _ in 0..iters {
-            signer.sign(&(0usize..index).chain((index+1)..(parties)).collect::<Vec<usize>>(), &"etaoin shrdlu".as_bytes(), &mut rng, &mut recvvec, &mut sendvec).unwrap();
+            signer
+                .sign(
+                    &(0usize..index)
+                        .chain((index + 1)..(parties))
+                        .collect::<Vec<usize>>(),
+                    &"etaoin shrdlu".as_bytes(),
+                    &mut rng,
+                    &mut recvvec,
+                    &mut sendvec,
+                )
+                .unwrap();
         }
-        let setupend = PreciseTime::now();
-        println!("{:.3} ms avg", (setupstart.to(setupend).num_milliseconds() as f64)/(iters as f64));
+        let duration = start.elapsed();
+        println!(
+            "{:.3} ms avg",
+            (duration.as_millis() as f64) / (iters as f64)
+        );
     }
-
 }
