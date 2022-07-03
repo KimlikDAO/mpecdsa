@@ -1,0 +1,9 @@
+[package]
+name = "curves"
+version = "0.1.0"
+authors = ["abhi <abhi@neu.edu>", "Jack Doerner <j@ckdoerner.net>"]
+edition = "2021"
+
+[dependencies]
+rand = "0.3.16"
+rust-crypto = "^0.2"
